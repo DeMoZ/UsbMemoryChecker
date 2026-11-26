@@ -1,0 +1,96 @@
+name: Build and release
+
+# Every PR and push to main builds macOS and Windows and runs the checks. A v* tag (must match the version in
+# Cargo.toml) publishes a release:
+#   UsbMemoryCheker-macOS-<tag>.dmg              — for people (Apple Silicon)
+#   UsbMemoryCheker-<version>-macos-arm64.zip    — for the in-app update on macOS
+#   UsbMemoryCheker-<version>-windows-x64.zip    — Windows (the .exe), also used by the in-app update
+# Release notes come from docs/releases/<tag>.md; the app shows them in its update window.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")
+          [[ "v$version" == "$GITHUB_REF_NAME" ]] || { echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml ($version)"; exit 1; }
+      - name: Translations
+        run: node scripts/check-i18n.mjs
+      - name: Format and lints
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+      - name: Build .app, .dmg and the update zip (Apple Silicon)
+        run: scripts/build-macos.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: |
+            dist/UsbMemoryCheker-macOS.dmg
+            dist/UsbMemoryCheker-*-macos-arm64.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests and lints
+        run: |
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+      - name: Build .exe
+        run: cargo build --release
+      - name: Pack
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          New-Item -ItemType Directory -Force dist/win | Out-Null
+          Copy-Item target/release/usbmemorycheker.exe "dist/win/UsbMemoryCheker.exe"
+          Compress-Archive -Path "dist/win/UsbMemoryCheker.exe" -DestinationPath "dist/UsbMemoryCheker-$version-windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/UsbMemoryCheker-*-windows-x64.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=docs/releases/$GITHUB_REF_NAME.md
+          if [[ -f "$notes" ]]; then args=(--notes-file "../$notes"); else args=(--generate-notes); fi
+          cd dist
+          mv UsbMemoryCheker-macOS.dmg "UsbMemoryCheker-macOS-$GITHUB_REF_NAME.dmg"
+          files=("UsbMemoryCheker-macOS-$GITHUB_REF_NAME.dmg" UsbMemoryCheker-*-macos-arm64.zip UsbMemoryCheker-*-windows-x64.zip)
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "UsbMemoryCheker $GITHUB_REF_NAME" "${args[@]}" \
+            "${files[@]}"
