@@ -1,4 +1,4 @@
-# UsbMemoryCheker
+# UsbMemoryChecker
 
 **Проверка USB-флешек и карт памяти: настоящая скорость чтения и записи, реальный объём и исправление поддельных
 носителей.**
@@ -36,11 +36,11 @@ macOS (Apple Silicon) и Windows · English, Русский, Español, Deutsch, 
 
 Скачайте последний релиз со страницы [Releases](https://github.com/DeMoZ/UsbMemoryChecker/releases/latest):
 
-- **macOS (Apple Silicon):** `UsbMemoryCheker-macOS-v<версия>.dmg` — откройте и перетащите программу в
+- **macOS (Apple Silicon):** `UsbMemoryChecker-macOS-v<версия>.dmg` — откройте и перетащите программу в
   «Программы». Программа не нотаризована: при первом запуске — правый клик → **Открыть**, или
-  `xattr -dr com.apple.quarantine /Applications/UsbMemoryCheker.app`.
-- **Windows 10/11 (x64):** `UsbMemoryCheker-<версия>-windows-x64.zip` — распакуйте и запустите
-  `UsbMemoryCheker.exe`. WebView2 уже есть в Windows 11 и в актуальной Windows 10.
+  `xattr -dr com.apple.quarantine /Applications/UsbMemoryChecker.app`.
+- **Windows 10/11 (x64):** `UsbMemoryChecker-<версия>-windows-x64.zip` — распакуйте и запустите
+  `UsbMemoryChecker.exe`. WebView2 уже есть в Windows 11 и в актуальной Windows 10.
 
 ## Как пользоваться
 
@@ -71,21 +71,21 @@ macOS (Apple Silicon) и Windows · English, Русский, Español, Deutsch, 
 ```bash
 cargo run --release           # запустить программу
 cargo test                    # тесты (быстрая проверка гоняется на имитациях поддельных носителей)
-scripts/build-macos.sh        # macOS: dist/UsbMemoryCheker.app, .dmg и .zip для обновления
+scripts/build-macos.sh        # macOS: dist/UsbMemoryChecker.app, .dmg и .zip для обновления
 ```
 
 Командная строка без окна (ответ в JSON):
 
 ```bash
-usbmemorycheker --cli list
-usbmemorycheker --cli speed disk4 1000
-usbmemorycheker --cli probe disk4
-usbmemorycheker --cli full disk4
+usbmemorychecker --cli list
+usbmemorychecker --cli speed disk4 1000
+usbmemorychecker --cli probe disk4
+usbmemorychecker --cli full disk4
 ```
 
 ## Поддержать
 
-UsbMemoryCheker бесплатный. Если он уберёг вас от поддельной флешки или потерянных файлов, кнопка **Поддержать** в
+UsbMemoryChecker бесплатный. Если он уберёг вас от поддельной флешки или потерянных файлов, кнопка **Поддержать** в
 программе покажет, как поддержать его развитие.
 
 ## Лицензия

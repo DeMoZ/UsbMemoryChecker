@@ -2185,7 +2185,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "usbmemorycheker"
+name = "usbmemorychecker"
 version = "0.1.0"
 dependencies = [
  "libc",

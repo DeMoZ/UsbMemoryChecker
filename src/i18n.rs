@@ -23,15 +23,15 @@ pub fn resolve(setting: &str) -> &'static str {
 /// Text of the macOS administrator password window.
 pub fn admin_prompt(lang: &str) -> &'static str {
     match lang {
-        "ru" => "UsbMemoryCheker нужен доступ администратора, чтобы напрямую проверить или переразметить носитель.",
+        "ru" => "UsbMemoryChecker нужен доступ администратора, чтобы напрямую проверить или переразметить носитель.",
         "es" => {
-            "UsbMemoryCheker necesita permisos de administrador para comprobar o reparticionar la unidad directamente."
+            "UsbMemoryChecker necesita permisos de administrador para comprobar o reparticionar la unidad directamente."
         }
         "de" => {
-            "UsbMemoryCheker benötigt Administratorrechte, um das Laufwerk direkt zu prüfen oder neu zu partitionieren."
+            "UsbMemoryChecker benötigt Administratorrechte, um das Laufwerk direkt zu prüfen oder neu zu partitionieren."
         }
-        "zh" => "UsbMemoryCheker 需要管理员权限才能直接检测或重新分区该存储设备。",
-        _ => "UsbMemoryCheker needs administrator rights to test or repartition the drive directly.",
+        "zh" => "UsbMemoryChecker 需要管理员权限才能直接检测或重新分区该存储设备。",
+        _ => "UsbMemoryChecker needs administrator rights to test or repartition the drive directly.",
     }
 }
 

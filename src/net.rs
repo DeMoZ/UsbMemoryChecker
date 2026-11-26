@@ -20,7 +20,7 @@ pub fn command(program: &str) -> Command {
 fn curl() -> Command {
     let mut c = command(if cfg!(windows) { "curl.exe" } else { "/usr/bin/curl" });
     // GitHub API без User-Agent отвечает отказом.
-    c.args(["-fsSL", "--proto", "=https", "-A", "UsbMemoryCheker"]).stdin(Stdio::null());
+    c.args(["-fsSL", "--proto", "=https", "-A", "UsbMemoryChecker"]).stdin(Stdio::null());
     c
 }
 
@@ -83,15 +83,15 @@ fn base_dir(var_win: &str, mac: &str, linux: &str) -> PathBuf {
     } else {
         home.join(linux)
     };
-    dir.join("UsbMemoryCheker")
+    dir.join("UsbMemoryChecker")
 }
 
-/// Настройки: `~/Library/Application Support/UsbMemoryCheker`, `%APPDATA%\UsbMemoryCheker`.
+/// Настройки: `~/Library/Application Support/UsbMemoryChecker`, `%APPDATA%\UsbMemoryChecker`.
 pub fn config_dir() -> PathBuf {
     base_dir("APPDATA", "Library/Application Support", ".config")
 }
 
-/// Кэш: `~/Library/Caches/UsbMemoryCheker`, `%LOCALAPPDATA%\UsbMemoryCheker`.
+/// Кэш: `~/Library/Caches/UsbMemoryChecker`, `%LOCALAPPDATA%\UsbMemoryChecker`.
 pub fn cache_dir() -> PathBuf {
     base_dir("LOCALAPPDATA", "Library/Caches", ".cache")
 }

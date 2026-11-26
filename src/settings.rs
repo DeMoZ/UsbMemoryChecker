@@ -50,7 +50,12 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(file()).map(|t| Self::from_json(&t)).unwrap_or_default()
+        // up to v0.1.0 the app was called UsbMemoryCheker and kept its settings in a folder of that name
+        let old = file().parent().and_then(|d| d.parent()).map(|d| d.join("UsbMemoryCheker").join("settings.json"));
+        std::fs::read_to_string(file())
+            .or_else(|e| old.map_or(Err(e), std::fs::read_to_string))
+            .map(|t| Self::from_json(&t))
+            .unwrap_or_default()
     }
 
     pub fn save(&self) {

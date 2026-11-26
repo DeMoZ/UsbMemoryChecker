@@ -1,11 +1,11 @@
 //! Command line without a window, for scripts and for checking the engines on a real drive:
 //!
 //! ```text
-//! usbmemorycheker --cli list
-//! usbmemorycheker --cli speed <disk> <MB>
-//! usbmemorycheker --cli full <disk> [limit MB]
-//! usbmemorycheker --cli probe <disk>        (asks for administrator rights like the window does)
-//! usbmemorycheker --cli fix <disk> <real bytes|0> [exfat|fat32] [LABEL]
+//! usbmemorychecker --cli list
+//! usbmemorychecker --cli speed <disk> <MB>
+//! usbmemorychecker --cli full <disk> [limit MB]
+//! usbmemorychecker --cli probe <disk>        (asks for administrator rights like the window does)
+//! usbmemorychecker --cli fix <disk> <real bytes|0> [exfat|fat32] [LABEL]
 //! ```
 //!
 //! Prints JSON results to stdout, progress to stderr.

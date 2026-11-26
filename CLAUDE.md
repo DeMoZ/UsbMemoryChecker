@@ -1,4 +1,4 @@
-# UsbMemoryCheker
+# UsbMemoryChecker
 
 Проверка USB-флешек и карт памяти: скорость чтения/записи (100 МБ / 1 ГБ / 5 ГБ, средняя / макс / мин), реальный
 объём (поиск поддельных «2 ТБ» флешек) и исправление — раздел на реальный объём. macOS (Apple Silicon) и Windows.
@@ -18,8 +18,8 @@ Rust (edition 2024) + tao 0.37 / wry 0.57 (системный WebView: WKWebView
 - `dio.rs` — прямой ввод-вывод мимо кэша: `F_NOCACHE` + `F_FULLFSYNC` на Mac, `FILE_FLAG_NO_BUFFERING |
   WRITE_THROUGH` в Windows (буферы, смещения и размеры кратны 4 КиБ — `AlignedBuf`).
 - `pattern.rs` — тестовые данные: каждый блок 4 КиБ зависит от адреса и соли запуска.
-- `bench.rs` — тест скорости (файл `.UsbMemoryCheker-speed.bin`, окна по 16 МиБ для макс/мин).
-- `fullcheck.rs` — полная проверка без стирания: папка `UsbMemoryCheker-test` из файлов по 1 ГиБ на всё свободное
+- `bench.rs` — тест скорости (файл `.UsbMemoryChecker-speed.bin`, окна по 16 МиБ для макс/мин).
+- `fullcheck.rs` — полная проверка без стирания: папка `UsbMemoryChecker-test` из файлов по 1 ГиБ на всё свободное
   место, потом чтение и сверка.
 - `probe.rs` — быстрая проверка (как f3probe) поверх `trait Device`; тесты на имитациях подделок (обёртка по 2^k,
   потерянные записи, кэш, сбои в середине, отмена).
@@ -45,8 +45,12 @@ Rust (edition 2024) + tao 0.37 / wry 0.57 (системный WebView: WKWebView
 - Размер раздела при исправлении — `helper::partition_size` (реальный − 2 МиБ, кратно МиБ); в окне та же формула
   (`repairSize`). FAT32 — только до 32 ГБ.
 - Проверка на RAM-диске: `hdiutil attach -nomount ram://4194304`, `diskutil eraseDisk FAT32 UMCTEST MBR diskN`,
-  затем `UMC_SHOW_VIRTUAL=1 UMC_NO_ELEVATE=1 target/release/usbmemorycheker --cli probe diskN`.
+  затем `UMC_SHOW_VIRTUAL=1 UMC_NO_ELEVATE=1 target/release/usbmemorychecker --cli probe diskN`.
   `UMC_DEV_SCRIPT='js'` выполняет скрипт в окне через 2,5 с после запуска (для снимков экрана).
+- До v0.1.0 включительно программа называлась UsbMemoryCheker (репозиторий переименован 2026-11-26). Ради
+  обновления старых копий: в Windows .zip кладётся тот же .exe ещё и как `UsbMemoryCheker.exe` (старый апдейтер ищет
+  его), настройки читаются из старой папки `UsbMemoryCheker`, если новой нет. На Mac старая копия обновится в
+  прежнюю папку `UsbMemoryCheker.app`. Убирать это можно, когда v0.1.0 уже не встречается.
 - На настоящей Windows программа не проверялась; CI собирает и гоняет там тесты и clippy.
 
 ## Проверки и релиз
@@ -54,7 +58,7 @@ Rust (edition 2024) + tao 0.37 / wry 0.57 (системный WebView: WKWebView
 - `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `node scripts/check-i18n.mjs`;
   Windows с Mac: `cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings`.
 - Языки: en, ru, es, de, zh (`i18n.rs` `LANGUAGES` = ключи `I18N`). Новый ключ — сразу во все 5 языков. Тексты
-  доната — в `usbmemorycheker.json` репозитория DeMoZ/donations и в `assets/donations.json` (держать одинаковыми).
+  доната — в `usbmemorychecker.json` репозитория DeMoZ/donations и в `assets/donations.json` (держать одинаковыми).
 - Релиз: `version` в `Cargo.toml` + `docs/releases/v<версия>.md` (en + ru, их видно в окне обновления) + тег
   `v<версия>` на main. CI выкладывает .dmg, Mac .zip и Windows .zip — **Windows в этом проекте выпускается всегда**
   (так попросил Роман, 2026-11-26).

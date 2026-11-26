@@ -1,7 +1,7 @@
-//! Обновление программы из релизов GitHub, как в ADB Toolkit, UsbMemoryCheker и EnhanceCapCut, на обеих системах.
+//! Обновление программы из релизов GitHub, как в ADB Toolkit, UsbMemoryChecker и EnhanceCapCut, на обеих системах.
 //!
 //! Последний релиз берётся из GitHub API; в нём ищется архив для своей системы
-//! (`…-macos-arm64.zip` с `UsbMemoryCheker.app` или `…-windows-x64.zip` с `UsbMemoryCheker.exe`). Скачанный архив сверяется
+//! (`…-macos-arm64.zip` с `UsbMemoryChecker.app` или `…-windows-x64.zip` с `UsbMemoryChecker.exe`). Скачанный архив сверяется
 //! с SHA-256, который GitHub публикует для каждого файла релиза, распаковывается во временную папку, а заменяет
 //! программу небольшой скрипт уже после её выхода и запускает новую версию.
 
@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::net::{self, command};
 
 pub const REPO: &str = "DeMoZ/UsbMemoryChecker";
-const WORK_PREFIX: &str = "UsbMemoryCheker-update-";
-const EXE: &str = "UsbMemoryCheker.exe";
+const WORK_PREFIX: &str = "UsbMemoryChecker-update-";
+const EXE: &str = "UsbMemoryChecker.exe";
 
 /// Суффикс архива для этой системы.
 pub fn asset_suffix() -> &'static str {
@@ -89,7 +89,7 @@ pub fn latest() -> Result<Option<Release>, String> {
     Ok(parse_release(&String::from_utf8_lossy(&data), asset_suffix()))
 }
 
-/// Где лежит программа, которую заменит обновление: `UsbMemoryCheker.app` на Mac, папка с .exe в Windows.
+/// Где лежит программа, которую заменит обновление: `UsbMemoryChecker.app` на Mac, папка с .exe в Windows.
 /// None — сборка для разработки (`cargo run`) или программа запущена не из .app.
 pub fn install_target() -> Option<PathBuf> {
     if cfg!(debug_assertions) {
@@ -107,7 +107,7 @@ pub fn install_target() -> Option<PathBuf> {
 pub fn can_write(target: &Path) -> bool {
     let folder = if cfg!(target_os = "macos") { target.parent() } else { Some(target) };
     let Some(folder) = folder else { return false };
-    let probe = folder.join(format!(".usbmemorycheker-update-check-{}", std::process::id()));
+    let probe = folder.join(format!(".usbmemorychecker-update-check-{}", std::process::id()));
     let ok = std::fs::write(&probe, b"").is_ok();
     let _ = std::fs::remove_file(&probe);
     ok
@@ -184,7 +184,7 @@ fn sh_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
 }
 
-/// Папка загрузки (UsbMemoryCheker-update-<версия>), которую скрипт удалит после копирования.
+/// Папка загрузки (UsbMemoryChecker-update-<версия>), которую скрипт удалит после копирования.
 fn work_dir(source: &Path) -> PathBuf {
     source
         .ancestors()
@@ -235,7 +235,7 @@ pub fn windows_script(source: &Path, target: &Path, pid: u32) -> String {
 pub fn start_install(source: &Path, target: &Path) -> Result<(), String> {
     let pid = std::process::id();
     if cfg!(windows) {
-        let script = std::env::temp_dir().join("UsbMemoryCheker-update.ps1");
+        let script = std::env::temp_dir().join("UsbMemoryChecker-update.ps1");
         std::fs::write(&script, windows_script(source, target, pid)).map_err(|e| e.to_string())?;
         command("powershell.exe")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
@@ -243,7 +243,7 @@ pub fn start_install(source: &Path, target: &Path) -> Result<(), String> {
             .spawn()
             .map_err(|e| e.to_string())?;
     } else {
-        let script = std::env::temp_dir().join("UsbMemoryCheker-update.sh");
+        let script = std::env::temp_dir().join("UsbMemoryChecker-update.sh");
         std::fs::write(&script, mac_script(source, target, pid)).map_err(|e| e.to_string())?;
         command("/bin/bash").arg(&script).spawn().map_err(|e| e.to_string())?;
     }
@@ -256,9 +256,9 @@ mod tests {
 
     const LATEST: &str = r###"{"tag_name":"v0.4.0","html_url":"https://github.com/DeMoZ/UsbMemoryChecker/releases/tag/v0.4.0",
         "body":"## Что нового\n- Быстрее\n## Установка\nСкачайте","assets":[
-        {"name":"UsbMemoryCheker-macOS-v0.4.0.dmg","browser_download_url":"https://x/dmg"},
-        {"name":"UsbMemoryCheker-0.4.0-macos-arm64.zip","browser_download_url":"https://x/mac.zip","digest":"sha256:ABCDEF"},
-        {"name":"UsbMemoryCheker-0.4.0-windows-x64.zip","browser_download_url":"https://x/win.zip"}]}"###;
+        {"name":"UsbMemoryChecker-macOS-v0.4.0.dmg","browser_download_url":"https://x/dmg"},
+        {"name":"UsbMemoryChecker-0.4.0-macos-arm64.zip","browser_download_url":"https://x/mac.zip","digest":"sha256:ABCDEF"},
+        {"name":"UsbMemoryChecker-0.4.0-windows-x64.zip","browser_download_url":"https://x/win.zip"}]}"###;
 
     #[test]
     fn release_for_each_system() {
@@ -298,13 +298,13 @@ mod tests {
 
     #[test]
     fn scripts_quote_paths() {
-        let src = Path::new("/tmp/UsbMemoryCheker-update-0.4.0/app/UsbMemoryCheker.app");
-        let s = mac_script(src, Path::new("/Applications/UsbMemoryCheker.app"), 42);
+        let src = Path::new("/tmp/UsbMemoryChecker-update-0.4.0/app/UsbMemoryChecker.app");
+        let s = mac_script(src, Path::new("/Applications/UsbMemoryChecker.app"), 42);
         assert!(s.contains("kill -0 42"));
-        assert!(s.contains("'/Applications/UsbMemoryCheker.app.old'"));
-        assert!(s.contains("rm -rf '/Applications/UsbMemoryCheker.app.old' '/tmp/UsbMemoryCheker-update-0.4.0'"));
+        assert!(s.contains("'/Applications/UsbMemoryChecker.app.old'"));
+        assert!(s.contains("rm -rf '/Applications/UsbMemoryChecker.app.old' '/tmp/UsbMemoryChecker-update-0.4.0'"));
         // пути собираются через Path::join, поэтому проверка не зависит от разделителя в системе
-        let work = std::env::temp_dir().join("UsbMemoryCheker-update-0.4.0");
+        let work = std::env::temp_dir().join("UsbMemoryChecker-update-0.4.0");
         let target = std::env::temp_dir().join("Rom's tools");
         let w = windows_script(&work.join("app"), &target, 7);
         assert!(w.contains("Wait-Process -Id 7"));

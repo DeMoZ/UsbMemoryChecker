@@ -5,8 +5,8 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
-        res.set("FileDescription", "UsbMemoryCheker");
-        res.set("ProductName", "UsbMemoryCheker");
+        res.set("FileDescription", "UsbMemoryChecker");
+        res.set("ProductName", "UsbMemoryChecker");
         if let Err(e) = res.compile() {
             println!("cargo:warning=icon not added: {e}");
         }

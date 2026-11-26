@@ -1,4 +1,4 @@
-//! UsbMemoryCheker — checks USB flash drives and memory cards: read/write speed, real capacity (finds fake
+//! UsbMemoryChecker — checks USB flash drives and memory cards: read/write speed, real capacity (finds fake
 //! drives that report more than they hold) and repairs a fake drive so it shows only its real size.
 //!
 //! Window: tao + wry (system WebView), page in `ui/index.html`. Threads: the WebView lives only in the main
@@ -166,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[allow(unused_mut)]
     let mut builder = WindowBuilder::new()
-        .with_title("UsbMemoryCheker")
+        .with_title("UsbMemoryChecker")
         .with_inner_size(tao::dpi::LogicalSize::new(1180.0, 800.0))
         .with_min_inner_size(tao::dpi::LogicalSize::new(880.0, 620.0));
     #[cfg(target_os = "macos")]
