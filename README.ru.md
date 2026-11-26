@@ -34,7 +34,7 @@ macOS (Apple Silicon) и Windows · English, Русский, Español, Deutsch, 
 
 ## Установка
 
-Скачайте последний релиз со страницы [Releases](https://github.com/DeMoZ/UsbMemoryCheker/releases/latest):
+Скачайте последний релиз со страницы [Releases](https://github.com/DeMoZ/UsbMemoryChecker/releases/latest):
 
 - **macOS (Apple Silicon):** `UsbMemoryCheker-macOS-v<версия>.dmg` — откройте и перетащите программу в
   «Программы». Программа не нотаризована: при первом запуске — правый клик → **Открыть**, или

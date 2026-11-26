@@ -33,7 +33,7 @@ macOS (Apple Silicon) and Windows · English, Русский, Español, Deutsch,
 
 ## Install
 
-Download the latest release from [Releases](https://github.com/DeMoZ/UsbMemoryCheker/releases/latest):
+Download the latest release from [Releases](https://github.com/DeMoZ/UsbMemoryChecker/releases/latest):
 
 - **macOS (Apple Silicon):** `UsbMemoryCheker-macOS-v<version>.dmg` — open it and drag the app to Applications.
   The app is not notarized: on the first start right-click it → **Open**, or run
