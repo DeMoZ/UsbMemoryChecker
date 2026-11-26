@@ -1,4 +1,4 @@
-//! Окно «Поддержать»: ссылки и тексты из репозитория DeMoZ/donations (файл `usbmemorycheker.json`, формат schema 1),
+//! Окно «Поддержать»: ссылки и тексты из репозитория DeMoZ/donations (файл `usbmemorychecker.json`, формат schema 1),
 //! как в ADB Toolkit, 360Cleaner, EnhanceCapCut, LocalAIBar и UniversalKM. Ссылки меняются там без нового релиза программы.
 //!
 //! Порядок: raw.githubusercontent.com, зеркало jsDelivr, последняя сохранённая копия, копия внутри программы.
@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::net;
 
-pub const FILE: &str = "usbmemorycheker.json";
+pub const FILE: &str = "usbmemorychecker.json";
 const BUILT_IN: &str = include_str!("../assets/donations.json");
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -127,7 +127,7 @@ mod tests {
     fn built_in_file_is_valid() {
         for lang in crate::i18n::LANGUAGES {
             let info = parse(BUILT_IN.as_bytes(), lang).unwrap();
-            assert!(info.message.unwrap().contains("UsbMemoryCheker"));
+            assert!(info.message.unwrap().contains("UsbMemoryChecker"));
         }
         let info = parse(BUILT_IN.as_bytes(), "ru").unwrap();
         assert!(info.methods[0].title.contains("Карта"));

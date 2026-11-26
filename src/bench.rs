@@ -119,7 +119,7 @@ fn io_err(what: &str, path: &Path, e: std::io::Error) -> Error {
 }
 
 pub fn test_file(dir: &Path) -> PathBuf {
-    dir.join(".UsbMemoryCheker-speed.bin")
+    dir.join(".UsbMemoryChecker-speed.bin")
 }
 
 /// Removes the test file when the test ends in any way.

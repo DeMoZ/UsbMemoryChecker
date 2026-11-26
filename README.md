@@ -1,4 +1,4 @@
-# UsbMemoryCheker
+# UsbMemoryChecker
 
 **Check USB flash drives and memory cards: real read/write speed, real capacity, and repair of fake drives.**
 
@@ -35,10 +35,10 @@ macOS (Apple Silicon) and Windows · English, Русский, Español, Deutsch,
 
 Download the latest release from [Releases](https://github.com/DeMoZ/UsbMemoryChecker/releases/latest):
 
-- **macOS (Apple Silicon):** `UsbMemoryCheker-macOS-v<version>.dmg` — open it and drag the app to Applications.
+- **macOS (Apple Silicon):** `UsbMemoryChecker-macOS-v<version>.dmg` — open it and drag the app to Applications.
   The app is not notarized: on the first start right-click it → **Open**, or run
-  `xattr -dr com.apple.quarantine /Applications/UsbMemoryCheker.app`.
-- **Windows 10/11 (x64):** `UsbMemoryCheker-<version>-windows-x64.zip` — unpack and run `UsbMemoryCheker.exe`.
+  `xattr -dr com.apple.quarantine /Applications/UsbMemoryChecker.app`.
+- **Windows 10/11 (x64):** `UsbMemoryChecker-<version>-windows-x64.zip` — unpack and run `UsbMemoryChecker.exe`.
   The WebView2 runtime is built into Windows 11 and current Windows 10.
 
 ## How to use
@@ -70,16 +70,16 @@ Needs [Rust](https://rustup.rs) (edition 2024).
 ```bash
 cargo run --release           # run the app
 cargo test                    # tests (the probe is tested against simulated fake drives)
-scripts/build-macos.sh        # macOS: dist/UsbMemoryCheker.app, .dmg and the update .zip
+scripts/build-macos.sh        # macOS: dist/UsbMemoryChecker.app, .dmg and the update .zip
 ```
 
 Command line without the window (JSON output):
 
 ```bash
-usbmemorycheker --cli list
-usbmemorycheker --cli speed disk4 1000
-usbmemorycheker --cli probe disk4
-usbmemorycheker --cli full disk4
+usbmemorychecker --cli list
+usbmemorychecker --cli speed disk4 1000
+usbmemorychecker --cli probe disk4
+usbmemorychecker --cli full disk4
 ```
 
 Built with [tao](https://github.com/tauri-apps/tao) + [wry](https://github.com/tauri-apps/wry) (system WebView),
@@ -87,7 +87,7 @@ no runtime besides the OS.
 
 ## Support
 
-UsbMemoryCheker is free. If it saved you from a fake drive or lost files, the **Support** button in the app shows
+UsbMemoryChecker is free. If it saved you from a fake drive or lost files, the **Support** button in the app shows
 ways to support its development.
 
 ## License

@@ -2,9 +2,9 @@ name: Build and release
 
 # Every PR and push to main builds macOS and Windows and runs the checks. A v* tag (must match the version in
 # Cargo.toml) publishes a release:
-#   UsbMemoryCheker-macOS-<tag>.dmg              — for people (Apple Silicon)
-#   UsbMemoryCheker-<version>-macos-arm64.zip    — for the in-app update on macOS
-#   UsbMemoryCheker-<version>-windows-x64.zip    — Windows (the .exe), also used by the in-app update
+#   UsbMemoryChecker-macOS-<tag>.dmg              — for people (Apple Silicon)
+#   UsbMemoryChecker-<version>-macos-arm64.zip    — for the in-app update on macOS
+#   UsbMemoryChecker-<version>-windows-x64.zip    — Windows (the .exe), also used by the in-app update
 # Release notes come from docs/releases/<tag>.md; the app shows them in its update window.
 
 on:
@@ -44,8 +44,8 @@ jobs:
         with:
           name: macos
           path: |
-            dist/UsbMemoryCheker-macOS.dmg
-            dist/UsbMemoryCheker-*-macos-arm64.zip
+            dist/UsbMemoryChecker-macOS.dmg
+            dist/UsbMemoryChecker-*-macos-arm64.zip
 
   windows:
     runs-on: windows-latest
@@ -66,12 +66,14 @@ jobs:
         run: |
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           New-Item -ItemType Directory -Force dist/win | Out-Null
-          Copy-Item target/release/usbmemorycheker.exe "dist/win/UsbMemoryCheker.exe"
-          Compress-Archive -Path "dist/win/UsbMemoryCheker.exe" -DestinationPath "dist/UsbMemoryCheker-$version-windows-x64.zip" -Force
+          Copy-Item target/release/usbmemorychecker.exe "dist/win/UsbMemoryChecker.exe"
+          # v0.1.0 was called UsbMemoryCheker: its updater looks for that .exe in the archive and starts it
+          Copy-Item target/release/usbmemorychecker.exe "dist/win/UsbMemoryCheker.exe"
+          Compress-Archive -Path "dist/win/UsbMemoryChecker.exe", "dist/win/UsbMemoryCheker.exe" -DestinationPath "dist/UsbMemoryChecker-$version-windows-x64.zip" -Force
       - uses: actions/upload-artifact@v7
         with:
           name: windows
-          path: dist/UsbMemoryCheker-*-windows-x64.zip
+          path: dist/UsbMemoryChecker-*-windows-x64.zip
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -90,7 +92,7 @@ jobs:
           notes=docs/releases/$GITHUB_REF_NAME.md
           if [[ -f "$notes" ]]; then args=(--notes-file "../$notes"); else args=(--generate-notes); fi
           cd dist
-          mv UsbMemoryCheker-macOS.dmg "UsbMemoryCheker-macOS-$GITHUB_REF_NAME.dmg"
-          files=("UsbMemoryCheker-macOS-$GITHUB_REF_NAME.dmg" UsbMemoryCheker-*-macos-arm64.zip UsbMemoryCheker-*-windows-x64.zip)
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "UsbMemoryCheker $GITHUB_REF_NAME" "${args[@]}" \
+          mv UsbMemoryChecker-macOS.dmg "UsbMemoryChecker-macOS-$GITHUB_REF_NAME.dmg"
+          files=("UsbMemoryChecker-macOS-$GITHUB_REF_NAME.dmg" UsbMemoryChecker-*-macos-arm64.zip UsbMemoryChecker-*-windows-x64.zip)
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "UsbMemoryChecker $GITHUB_REF_NAME" "${args[@]}" \
             "${files[@]}"

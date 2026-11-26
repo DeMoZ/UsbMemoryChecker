@@ -229,7 +229,7 @@ fn run_fix(disk: &Disk, job: &Job) -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        let script = std::env::temp_dir().join(format!("UsbMemoryCheker-fix-{}.txt", std::process::id()));
+        let script = std::env::temp_dir().join(format!("UsbMemoryChecker-fix-{}.txt", std::process::id()));
         std::fs::write(&script, diskpart_script(&disk.id, job)).map_err(|e| e.to_string())?;
         let out = crate::net::command("diskpart.exe").arg("/s").arg(&script).output();
         let _ = std::fs::remove_file(&script);
@@ -254,7 +254,7 @@ pub enum RunError {
 
 fn job_dir() -> PathBuf {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    std::env::temp_dir().join(format!("UsbMemoryCheker-job-{}-{t}", std::process::id()))
+    std::env::temp_dir().join(format!("UsbMemoryChecker-job-{}-{t}", std::process::id()))
 }
 
 /// Runs the job elevated and waits for it. `on_progress` gets (fraction, stage key).

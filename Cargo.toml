@@ -1,6 +1,6 @@
 [package]
-name = "usbmemorycheker"
-version = "0.1.0"
+name = "usbmemorychecker"
+version = "0.1.1"
 edition = "2024"
 authors = ["DeMoZ"]
 description = "Checks USB flash drives and memory cards: read/write speed, real capacity (fake drive detection) and repair to the real size"

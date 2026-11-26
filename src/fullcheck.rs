@@ -16,7 +16,7 @@ use crate::pattern::{self, BLOCK};
 pub const FILE_SIZE: u64 = 1 << 30;
 /// Left free for the file system's own records.
 pub const RESERVE: u64 = 8 << 20;
-pub const FOLDER: &str = "UsbMemoryCheker-test";
+pub const FOLDER: &str = "UsbMemoryChecker-test";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
