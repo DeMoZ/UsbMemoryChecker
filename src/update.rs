@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::net::{self, command};
 
-pub const REPO: &str = "DeMoZ/UsbMemoryCheker";
+pub const REPO: &str = "DeMoZ/UsbMemoryChecker";
 const WORK_PREFIX: &str = "UsbMemoryCheker-update-";
 const EXE: &str = "UsbMemoryCheker.exe";
 
@@ -254,7 +254,7 @@ pub fn start_install(source: &Path, target: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const LATEST: &str = r###"{"tag_name":"v0.4.0","html_url":"https://github.com/DeMoZ/UsbMemoryCheker/releases/tag/v0.4.0",
+    const LATEST: &str = r###"{"tag_name":"v0.4.0","html_url":"https://github.com/DeMoZ/UsbMemoryChecker/releases/tag/v0.4.0",
         "body":"## Что нового\n- Быстрее\n## Установка\nСкачайте","assets":[
         {"name":"UsbMemoryCheker-macOS-v0.4.0.dmg","browser_download_url":"https://x/dmg"},
         {"name":"UsbMemoryCheker-0.4.0-macos-arm64.zip","browser_download_url":"https://x/mac.zip","digest":"sha256:ABCDEF"},
