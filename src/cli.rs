@@ -56,13 +56,24 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             let d = disk(args.get(1))?;
             let limit = args.get(2).and_then(|s| s.parse::<u64>().ok()).map(|mb| mb << 20);
             let mut last = 0u64;
+            let mut told_early = false;
             let r = fullcheck::run(&mount(&d)?, limit, &cancel, &mut |p| {
+                if p.early && !told_early {
+                    told_early = true;
+                    eprintln!("data loss found after {} MB: writing stopped, checking what was written", p.total >> 20);
+                }
                 if p.done >= last + (256 << 20) || p.done == p.total {
                     last = p.done;
                     eprintln!("{} {} / {} MB", p.op, p.done >> 20, p.total >> 20);
                 }
             })
             .map_err(|e| format!("{e:?}"))?;
+            if r.stopped_early && !told_early {
+                eprintln!(
+                    "writing stopped early after {} MB: samples could not be read, checked what was written",
+                    r.tested >> 20
+                );
+            }
             Ok(json!(r))
         }
         Some(action @ ("probe" | "fix")) => {

@@ -5,7 +5,7 @@
 pub const BLOCK: usize = 4096;
 const WORDS: usize = BLOCK / 8;
 
-fn splitmix(mut x: u64) -> u64 {
+pub(crate) fn splitmix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -46,6 +46,14 @@ pub fn count_bad(buf: &[u8], start: u64, salt: u64) -> usize {
             **block != expected
         })
         .count()
+}
+
+/// If `block`, found at test position `pos`, is an intact block of a *later* position of this run, that position:
+/// its clear-text address says so and the whole block matches that address and the salt. Only a drive that wraps
+/// addresses returns such a block.
+pub fn later_addr(block: &[u8], pos: u64, salt: u64) -> Option<u64> {
+    let addr = u64::from_le_bytes(*block.first_chunk::<8>()?);
+    (addr > pos && addr.is_multiple_of(BLOCK as u64) && count_bad(block, addr, salt) == 0).then_some(addr)
 }
 
 /// Salt for a new run: time and process id are enough, it only has to differ between runs.

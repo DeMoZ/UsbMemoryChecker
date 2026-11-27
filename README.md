@@ -18,10 +18,16 @@ macOS (Apple Silicon) and Windows · English, Русский, Español, Deutsch,
   - **Quick check** — about a minute for any size, even 2 TB. Tests ~1000 points across the whole device directly
     (like `f3probe`), finds the exact boundary to 1 MB. Asks for administrator rights. Everything it overwrites is
     read first and written back at the end, so your files survive.
-  - **Full check** — fills all free space with test files and reads them back (like H2testw). No rights needed,
-    your files stay, but it takes as long as writing the whole drive.
+  - **Full check** — fills all free space with test files and reads them back (like H2testw). No rights needed.
+    On a genuine drive your files stay and it takes as long as writing the whole free space. It reads back samples
+    after every 1 GB (about 1.6% extra reading), and on a fake drive it stops shortly (within about 1-2 GB) after the
+    drive starts losing data, then verifies what was written. After such an early stop only the written part is
+    checked. **On a fake drive files that are already on it can be damaged** (once the test data passes the real size,
+    the drive may write it over the start of the drive), so back them up first; the quick check does not have this
+    problem because it restores everything it overwrites.
 - **Repair.** Rewrites the partition table so the drive has a single partition of its *real* size (exFAT or
   FAT32), with the fake part left unused. After that the drive honestly shows, say, 31.9 GB and stops losing files.
+  Afterwards the window offers to run the full check on the repaired drive, to confirm the new size is right.
 - **Shows free and total space** of the volume, the size the drive declares, and the verified real size.
 - **Safe by design.** Only removable and external drives are listed; internal and system disks never appear. The
   elevated part checks the drive again (same id, same size) right before touching it.
@@ -61,7 +67,8 @@ good and the first bad point it repeats with a finer grid until the boundary is 
 old content is read, and at the end everything is written back in reverse order.
 
 Very unusual controllers that wrap by a non-power-of-two size may slip past the quick check — the full check catches
-everything, because it really writes and reads back every byte of free space.
+everything, because it really writes the free space and reads it back, stopping shortly (within about 1-2 GB) after
+the drive starts losing data; after an early stop only the written part is checked.
 
 ## Build from source
 

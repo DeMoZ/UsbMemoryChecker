@@ -275,6 +275,9 @@ tr:last-child td { border-bottom: 0; }
 .note svg { width: 16px; height: 16px; color: var(--amber); flex: none; margin-top: 2px; }
 .success { padding: 14px 16px; border-radius: 14px; background: color-mix(in srgb, var(--green) 12%, transparent); border: 1px solid color-mix(in srgb, var(--green) 35%, transparent); color: var(--text); display: none; gap: 10px; align-items: center; }
 .success.on { display: flex; }
+.offer { display: none; flex-direction: column; gap: 10px; padding: 14px 16px; border-radius: 14px; background: var(--glass); border: 1px solid var(--line-2); color: var(--text-2); font-size: 13px; }
+.offer.on { display: flex; }
+.offer-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .success svg { width: 18px; height: 18px; color: var(--green); }
 
 /* placeholder */
@@ -496,6 +499,10 @@ tr:last-child td { border-bottom: 0; }
           </div>
           <div class="progress" id="prog-repair"></div>
           <div class="success" id="repDone"><svg><use href="#i-check"/></svg><span id="repDoneText"></span></div>
+          <div class="offer" id="repVerify">
+            <div class="offer-text" id="repVerifyText"></div>
+            <div class="offer-row"><button class="btn btn-primary" id="repVerifyBtn" onclick="verifyRepaired()"><svg><use href="#i-scan"/></svg><span data-i18n="repVerifyBtn"></span></button><span class="h" id="repVerifyStatus"></span></div>
+          </div>
         </div>
       </div>
     </section>
@@ -864,6 +871,8 @@ function renderVerdict() {
     title = c.verdict === 'genuine' ? t('verdictGenuine') : t('verdictLoses');
     text = c.verdict === 'genuine' ? t('fullOk', { tested: fmtBytes(c.tested) })
       : t('fullBad', { bad: fmtBytes(c.bad), tested: fmtBytes(c.tested), real: fmtBytes(c.real) });
+    if (c.verdict === 'broken') text += ' ' + t('errBroken');
+    if (c.stoppedEarly && c.verdict !== 'genuine') text += ' ' + t('fullStoppedEarly');
     if (c.writeError) text += ' ' + t('fullWriteError', { err: c.writeError });
   } else {
     const key = { genuine: 'verdictGenuine', fake: 'verdictFake', damaged: 'verdictDamaged', broken: 'verdictBroken' }[c.verdict];
@@ -909,10 +918,56 @@ function renderRepair() {
   });
   $('repConfirmText').textContent = t('repConfirm', { name: d.name });
   const broken = c && c.verdict === 'broken';
+  if (broken) {
+    // the drive keeps nothing: no size to offer, say so instead of "formatted at its full size"
+    $('repLead').textContent = t('errBroken');
+    $('repSize').textContent = '–';
+    $('repSizeHint').textContent = '';
+  }
   $('repBtn').disabled = !!task || !$('repConfirm').checked || broken;
   const done = res(d.id).repaired;
   $('repDone').classList.toggle('on', !!done);
   $('repDoneText').textContent = done ? t('repDone', { size: fmtBytes(done) }) : '';
+  renderRepairOffer(d, res(d.id));
+}
+
+// After a repair the window offers the full check of the new partition. The new volume appears a few seconds
+// later (the drive list refreshes by itself), so the button waits for a mounted volume that fits the new size and
+// is not the old one: the list showed the disk unmounted in between, or the volume looks different from the one
+// before the repair, or enough time has passed.
+const VERIFY_SETTLE_MS = 3000, VERIFY_SLOW_SETTLE_MS = 10000, VERIFY_GIVE_UP_MS = 45000;
+let pendingVerify = null;   // disk id of a verifyRepaired request that Rust has not accepted yet
+function volumeKey(v) { return [v.mount, v.label, v.fs, v.total].join('|'); }
+function repairedVolume(d, r) {
+  return d.volumes.find(v => v.writable && v.mount && v.total <= r.repaired) || null;
+}
+function repairedVolumeIsNew(d, r) {
+  const v = repairedVolume(d, r);
+  if (!v) return false;
+  const waited = Date.now() - (r.repairedAt || 0);
+  const changed = r.unmountedSeen || !(r.oldVolumes || []).includes(volumeKey(v));
+  return waited >= (changed ? VERIFY_SETTLE_MS : VERIFY_SLOW_SETTLE_MS);
+}
+function renderRepairOffer(d, r) {
+  const on = !!r.repaired && !!r.offer;
+  $('repVerify').classList.toggle('on', on);
+  if (!on) return;
+  $('repVerifyText').textContent = t('repVerifyText');
+  const waited = Date.now() - (r.repairedAt || 0);
+  const ready = repairedVolumeIsNew(d, r);
+  $('repVerifyBtn').disabled = !!task || update.downloading || !!pendingVerify || !ready;
+  $('repVerifyStatus').textContent = ready ? '' : t(waited >= VERIFY_GIVE_UP_MS ? 'repVerifyNoMount' : 'repVerifyWaiting');
+}
+
+// the offer is kept until Rust accepts the request (a 'task' message); an error keeps it
+function verifyRepaired() {
+  const d = current(), r = d && res(d.id);
+  if (!d || !r || !r.offer || !repairedVolumeIsNew(d, r) || task || update.downloading || pendingVerify) return;
+  pendingVerify = d.id;
+  series = { write: [], read: [] }; seriesDisk = d.id; seriesKind = 'full';
+  showTab('capacity');
+  send('verifyRepaired', { disk: d.id });
+  renderAll();
 }
 
 function askRepair() {
@@ -925,7 +980,12 @@ function askRepair() {
 function doRepair() {
   closeModal('repairModal');
   if (!selected) return;
-  res(selected).repaired = 0;
+  const r = res(selected), d = current();
+  r.repaired = 0;
+  r.offer = false;
+  r.unmountedSeen = false;
+  r.oldVolumes = d ? d.volumes.map(volumeKey) : [];
+  r.diskSize = d ? d.size : 0;
   send('fix', { disk: selected, fs, label: $('repLabel').value || 'USB' });
 }
 
@@ -958,14 +1018,20 @@ function taskDone(msg) {
     toast(t(o.verdict === 'genuine' ? 'verdictGenuine' : o.verdict === 'fake' ? 'verdictFake' : o.verdict === 'damaged' ? 'verdictDamaged' : 'verdictBroken'), o.verdict === 'genuine' ? 'ok' : 'err');
   } else if (kind === 'full') {
     const o = msg.result.full, reported = msg.result.reported;
-    const verdict = o.bad > 0 ? 'fake' : 'genuine';
     // same as run_full in main.rs: 1% below the estimate
-    const real = verdict === 'genuine' ? reported : Math.floor(Math.min(o.realEstimate, reported) / 100) * 99;
-    r.capacity = { mode: 'full', verdict, real, reported, tested: o.tested, bad: o.bad, writeError: o.writeError,
+    const real = o.bad > 0 ? Math.floor(Math.min(o.realEstimate, reported) / 100) * 99 : reported;
+    // a drive that keeps nothing (real 0) cannot be repaired: run_fix refuses it with errBroken
+    const verdict = o.bad === 0 ? 'genuine' : real > 0 ? 'fake' : 'broken';
+    r.capacity = { mode: 'full', verdict, real, reported, tested: o.tested, bad: o.bad, writeError: o.writeError, stoppedEarly: o.stoppedEarly,
       seconds: o.write.seconds + o.read.seconds, repairSize: repairSize(real, reported) };
     toast(verdict === 'genuine' ? t('verdictGenuine') : t('verdictLoses'), verdict === 'genuine' ? 'ok' : 'err');
   } else if (kind === 'fix') {
     r.repaired = msg.result.size;
+    r.repairedAt = Date.now();
+    r.offer = true;
+    setTimeout(renderRepair, VERIFY_SETTLE_MS + 200);
+    setTimeout(renderRepair, VERIFY_SLOW_SETTLE_MS + 200);
+    setTimeout(renderRepair, VERIFY_GIVE_UP_MS + 200);
     r.capacity = null;
     $('repConfirm').checked = false;
     toast(t('repDone', { size: fmtBytes(msg.result.size) }), 'ok', 8000);
@@ -1010,11 +1076,16 @@ window.onRustMessage = function (msg) {
       for (const id of Object.keys(results)) {
         const d = disks.find(x => x.id === id);
         if (d && results[id].capacity && results[id].capacity.reported !== d.size) results[id].capacity = null;
+        const r = results[id];
+        // the repair result is only about this very drive: gone or another size, no offer any more
+        if (r.repaired && (!d || (r.diskSize && d.size !== r.diskSize))) { r.repaired = 0; r.offer = false; }
+        if ((r.offer || (task && task.kind === 'fix' && task.disk === id)) && d && !d.volumes.some(v => v.mount)) r.unmountedSeen = true;
       }
       renderAll();
       break;
     case 'task':
       if (!task || task.kind !== msg.kind || task.disk !== msg.disk) task = { kind: msg.kind, disk: msg.disk, started: Date.now() };
+      if (pendingVerify && msg.kind === 'full' && msg.disk === pendingVerify) { res(pendingVerify).offer = false; pendingVerify = null; }
       task.fraction = msg.fraction; task.stage = msg.stage;
       if (msg.mbps) task.mbps = msg.mbps;
       renderProgress();
@@ -1026,10 +1097,17 @@ window.onRustMessage = function (msg) {
         if (tab === 'speed' && selected === seriesDisk) drawChart();
       }
       break;
+    case 'rescale':
+      if (msg.disk === seriesDisk && series[msg.op]) {
+        series[msg.op].forEach(p => { p.x *= msg.factor; });
+        if (tab === 'speed' && selected === seriesDisk) drawChart();
+      }
+      break;
     case 'taskDone':
       taskDone(msg);
       break;
     case 'error':
+      pendingVerify = null;
       toast(t(msg.key, fmtArgs(msg.args || {})), 'err', 8000);
       break;
     case 'confirmQuit':

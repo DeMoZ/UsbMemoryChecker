@@ -27,7 +27,8 @@ const html = readFileSync('src/ui/index.html', 'utf8');
 const used = new Set();
 for (const re of [/data-i18n(?:-title)?="(\w+)"/g, /\bt\('(\w+)'/g, /'(verdict\w+)'/g]) {
   for (const m of html.matchAll(re)) used.add(m[1]);
-}
+}// t(cond ? 'a' : 'b' ...): both keys
+for (const m of html.matchAll(/\bt\([^()'"]*\?\s*'(\w+)'\s*:\s*'(\w+)'/g)) { used.add(m[1]); used.add(m[2]); }
 for (const v of ['verdictGenuine', 'verdictFake', 'verdictDamaged', 'verdictBroken']) used.add(v + 'Text');
 for (const f of readdirSync('src').filter(f => f.endsWith('.rs'))) {
   const src = readFileSync('src/' + f, 'utf8');
