@@ -8,9 +8,12 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::dio::{self, AlignedBuf};
-use crate::pattern;
+use crate::dio;
+use crate::pattern::{self, BLOCK};
+use crate::pipe::{Checker, Filler};
 
+/// Size of one I/O call. Small enough that cancel acts within seconds even on a very slow drive (a call cannot
+/// be interrupted); a speed window ([`WINDOW`]) is several calls.
 pub const CHUNK: usize = 4 << 20;
 pub const WINDOW: u64 = 16 << 20;
 /// Kept free on the drive besides the test file.
@@ -131,7 +134,7 @@ impl Drop for Cleanup {
 }
 
 pub fn run(dir: &Path, bytes: u64, cancel: &AtomicBool, on_point: &mut dyn FnMut(Point)) -> Result<SpeedResult, Error> {
-    let bytes = bytes.div_ceil(CHUNK as u64) * CHUNK as u64;
+    let bytes = bytes.div_ceil(BLOCK as u64) * BLOCK as u64;
     let (free, _) = dio::space(dir).map_err(|e| io_err("could not read free space of", dir, e))?;
     if free < bytes + RESERVE {
         return Err(Error::NoSpace(bytes + RESERVE, free));
@@ -139,47 +142,62 @@ pub fn run(dir: &Path, bytes: u64, cancel: &AtomicBool, on_point: &mut dyn FnMut
     let path = test_file(dir);
     let _cleanup = Cleanup(path.clone());
     let salt = pattern::new_salt();
-    let mut buf = AlignedBuf::new(CHUNK);
 
-    let file = dio::create(&path).map_err(|e| io_err("could not create", &path, e))?;
-    let mut meter = Meter::default();
-    let mut off = 0u64;
-    while off < bytes {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error::Cancelled);
+    std::thread::scope(|scope| {
+        // ---- write: the helper thread prepares the next buffer while the current one is being written
+        let file = dio::create(&path).map_err(|e| io_err("could not create", &path, e))?;
+        let mut meter = Meter::default();
+        let mut filler = Filler::start(scope, salt, 0, bytes, CHUNK);
+        let mut off = 0u64;
+        while off < bytes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let Some(c) = filler.next() else {
+                return Err(Error::Io("the test data thread stopped unexpectedly".into()));
+            };
+            let t = Instant::now();
+            dio::write_at(&file, &c.buf[..c.len], c.start).map_err(|e| io_err("could not write", &path, e))?;
+            let secs = t.elapsed().as_secs_f64();
+            off += c.len as u64;
+            filler.recycle(c.buf);
+            if let Some(mbps) = meter.add(c.len as u64, secs) {
+                on_point(Point { op: "write", done: off, total: bytes, mbps });
+            }
         }
-        pattern::fill(&mut buf, off, salt);
+        drop(filler);
         let t = Instant::now();
-        dio::write_at(&file, &buf, off).map_err(|e| io_err("could not write", &path, e))?;
-        off += CHUNK as u64;
-        if let Some(mbps) = meter.add(CHUNK as u64, t.elapsed().as_secs_f64()) {
-            on_point(Point { op: "write", done: off, total: bytes, mbps });
-        }
-    }
-    let t = Instant::now();
-    dio::full_sync(&file).map_err(|e| io_err("could not flush", &path, e))?;
-    meter.add_time(t.elapsed().as_secs_f64());
-    drop(file);
-    let write = meter.finish();
+        dio::full_sync(&file).map_err(|e| io_err("could not flush", &path, e))?;
+        meter.add_time(t.elapsed().as_secs_f64());
+        drop(file);
+        let write = meter.finish();
 
-    let file = dio::open_read(&path).map_err(|e| io_err("could not open", &path, e))?;
-    let mut meter = Meter::default();
-    let mut bad_blocks = 0;
-    let mut off = 0u64;
-    while off < bytes {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error::Cancelled);
+        // ---- read: the helper thread verifies the previous buffer while the next one is being read
+        let file = dio::open_read(&path).map_err(|e| io_err("could not open", &path, e))?;
+        let mut meter = Meter::default();
+        let checker = Checker::start(scope, salt, CHUNK);
+        let mut off = 0u64;
+        while off < bytes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let n = (bytes - off).min(CHUNK as u64) as usize;
+            let mut buf = checker.buffer();
+            let t = Instant::now();
+            dio::read_at(&file, &mut buf[..n], off).map_err(|e| io_err("could not read", &path, e))?;
+            let secs = t.elapsed().as_secs_f64();
+            checker.check(buf, off, n, true);
+            off += n as u64;
+            if let Some(mbps) = meter.add(n as u64, secs) {
+                on_point(Point { op: "read", done: off, total: bytes, mbps });
+            }
         }
-        let t = Instant::now();
-        dio::read_at(&file, &mut buf, off).map_err(|e| io_err("could not read", &path, e))?;
-        let secs = t.elapsed().as_secs_f64();
-        bad_blocks += pattern::count_bad(&buf, off, salt);
-        off += CHUNK as u64;
-        if let Some(mbps) = meter.add(CHUNK as u64, secs) {
-            on_point(Point { op: "read", done: off, total: bytes, mbps });
-        }
-    }
-    Ok(SpeedResult { bytes, write, read: meter.finish(), bad_blocks })
+        let Some(tally) = checker.finish() else {
+            return Err(Error::Io("the verification thread stopped unexpectedly".into()));
+        };
+        let bad_blocks = (tally.bad / BLOCK as u64) as usize;
+        Ok(SpeedResult { bytes, write, read: meter.finish(), bad_blocks })
+    })
 }
 
 #[cfg(test)]
@@ -215,6 +233,63 @@ mod tests {
         assert!(matches!(e, Err(Error::NoSpace(..))));
         let cancelled = run(&dir, 40 << 20, &AtomicBool::new(true), &mut |_| {});
         assert!(matches!(cancelled, Err(Error::Cancelled)));
+        assert!(!test_file(&dir).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn odd_size_is_exact() {
+        let dir = std::env::temp_dir().join(format!("umc_bench_odd_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut points = Vec::new();
+        let size = (20 << 20) + 4096;
+        let r = run(&dir, size, &AtomicBool::new(false), &mut |p| points.push(p)).unwrap();
+        assert_eq!(r.bytes, size);
+        assert_eq!(r.bad_blocks, 0);
+        assert_eq!(points.iter().filter(|p| p.op == "write").count(), 1);
+        assert_eq!(points.iter().filter(|p| p.op == "read").count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forty_mib_has_two_write_points() {
+        let dir = std::env::temp_dir().join(format!("umc_bench_40_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut points = Vec::new();
+        run(&dir, 40 << 20, &AtomicBool::new(false), &mut |p| points.push((p.op, p.done))).unwrap();
+        let writes: Vec<u64> = points.iter().filter(|p| p.0 == "write").map(|p| p.1).collect();
+        assert_eq!(writes, vec![16 << 20, 32 << 20]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_in_the_middle() {
+        let dir = std::env::temp_dir().join(format!("umc_bench_cancel_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = AtomicBool::new(false);
+        let r = run(&dir, 100 << 20, &cancel, &mut |_| cancel.store(true, Ordering::Relaxed));
+        assert!(matches!(r, Err(Error::Cancelled)));
+        assert!(!test_file(&dir).exists());
+        // and during the read phase
+        let cancel = AtomicBool::new(false);
+        let r = run(&dir, 100 << 20, &cancel, &mut |p| {
+            if p.op == "read" {
+                cancel.store(true, Ordering::Relaxed)
+            }
+        });
+        assert!(matches!(r, Err(Error::Cancelled)));
+        assert!(!test_file(&dir).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_panicking_helper_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("umc_bench_panic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::pipe::panic_next_helpers(true);
+        let r = run(&dir, 20 << 20, &AtomicBool::new(false), &mut |_| {});
+        crate::pipe::panic_next_helpers(false);
+        assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
         assert!(!test_file(&dir).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }

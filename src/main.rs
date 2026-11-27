@@ -18,6 +18,7 @@ mod helper;
 mod i18n;
 mod net;
 mod pattern;
+mod pipe;
 mod probe;
 mod rawdev;
 mod settings;
@@ -286,6 +287,8 @@ fn handle_request(req: Request, state: &Shared, ui: &Ui, proxy: &EventLoopProxy<
                 start_task(state, ui, "probe", req.disk, run_probe);
             }
         }
+        // the full check of a freshly repaired drive (offered by the window); does not change the saved check mode
+        "verifyRepaired" => start_task(state, ui, "full", req.disk, run_full),
         "fix" => {
             let (fs, label) = (req.fs.unwrap_or(helper::Fs::Exfat), req.label.unwrap_or_default());
             start_task(state, ui, "fix", req.disk, move |ctx| run_fix(ctx, fs, label));
@@ -444,7 +447,9 @@ where
             cancel,
             last_progress: Instant::now() - Duration::from_secs(1),
         };
-        let result = work(&mut ctx);
+        // a panic in the work (or in a helper thread of it) must not leave the task slot taken for good
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut ctx)))
+            .unwrap_or_else(|_| Err(("errIo", json!({"err": "internal error"}))));
         let cancelled = ctx.cancel.load(Ordering::Relaxed);
         let mut st = lock(&state);
         st.task = None;
@@ -486,13 +491,25 @@ fn run_speed(ctx: &mut TaskCtx, mb: u64) -> TaskResult {
 fn run_full(ctx: &mut TaskCtx) -> TaskResult {
     let mount = volume_path(ctx)?;
     let cancel = Arc::clone(&ctx.cancel);
+    let (mut last_write_x, mut rescaled) = (0.0f64, false);
     let r = fullcheck::run(&mount, None, &cancel, &mut |p| {
         let x = if p.total == 0 { 0.0 } else { p.done as f64 / p.total as f64 };
+        if p.op == "write" {
+            last_write_x = x;
+        } else if !rescaled && last_write_x > 0.0 && last_write_x < 0.999 {
+            // writing ended before the plan (early stop, full volume): stretch the write curve over the same width as the read-back
+            rescaled = true;
+            ctx.ui.send(json!({"type": "rescale", "disk": ctx.disk.id, "op": "write", "factor": 1.0 / last_write_x}));
+        }
         let fraction = if p.op == "write" { x * 0.5 } else { 0.5 + x * 0.5 };
         if let Some(mbps) = p.mbps {
             ctx.point(p.op, x, mbps);
         }
-        let stage = if p.op == "write" { "prFill" } else { "prVerify" };
+        let stage = match (p.op == "write", p.early) {
+            (true, _) => "prFill",
+            (false, true) => "prVerifyEarly",
+            (false, false) => "prVerify",
+        };
         ctx.progress(fraction, stage, json!({"done": p.done, "total": p.total, "mbps": p.mbps}));
     });
     match r {
@@ -508,6 +525,7 @@ fn run_full(ctx: &mut TaskCtx) -> TaskResult {
         Err(fullcheck::Error::Cancelled) => Err(("errCancelled", json!({}))),
         Err(fullcheck::Error::NoSpace(free)) => Err(("errNoSpaceFull", json!({"free": free}))),
         Err(fullcheck::Error::Io(e)) => Err(("errIo", json!({"err": e}))),
+        Err(fullcheck::Error::Inconclusive) => Err(("errFullInconclusive", json!({}))),
     }
 }
 
