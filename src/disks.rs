@@ -5,7 +5,7 @@
 //! - Windows: PowerShell `Get-Disk` / `Get-Partition` / `Get-Volume` as JSON; only USB / SD / MMC buses,
 //!   never the boot or system disk.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +17,24 @@ pub struct Volume {
     pub total: u64,
     pub free: u64,
     pub writable: bool,
+}
+
+/// Set in the elevated helper process: it never takes test hooks from the environment.
+static ELEVATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_elevated() {
+    ELEVATED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One entry of the partition table, mounted or not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Partition {
+    pub offset: u64,
+    pub size: u64,
+    /// Volume UUID on macOS (empty when the partition has none); always empty on Windows.
+    #[serde(default)]
+    pub id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -35,6 +53,14 @@ pub struct Disk {
     pub size: u64,
     pub block_size: u64,
     pub volumes: Vec<Volume>,
+    /// The partition table, also the partitions that are not mounted.
+    pub partitions: Vec<Partition>,
+    /// The partition table could not be read (a `diskutil info` of a partition failed or timed out, or
+    /// `Get-Partition` failed): the drive is listed without partitions, and nothing known about it is confirmed.
+    #[serde(skip)]
+    pub table_unreadable: bool,
+    /// Windows: the MBR disk signature (8 hex digits) or the GPT disk GUID. Empty on macOS.
+    pub table_id: String,
 }
 
 impl Disk {
@@ -81,19 +107,50 @@ pub fn list() -> Result<Vec<Disk>, String> {
 mod mac {
     use super::*;
     use plist::{Dictionary, Value};
+    use std::time::Duration;
 
-    fn diskutil(args: &[&str]) -> Result<Dictionary, String> {
-        let out = crate::net::command("/usr/sbin/diskutil")
-            .args(args)
-            .output()
-            .map_err(|e| format!("could not run diskutil: {e}"))?;
+    /// One `diskutil` call may take this long. A stuck list or whole-disk call fails the scan (the previous list stays)
+    /// instead of blocking it; a stuck call for one partition only leaves that drive without a partition table.
+    const DISKUTIL_LIMIT: Duration = Duration::from_secs(10);
+
+    /// Why a `diskutil` call failed. For the list and a whole disk a timeout fails the scan and any other failure skips
+    /// that disk; a failed call for a partition only leaves its drive without a partition table.
+    pub struct Failure {
+        pub timed_out: bool,
+        pub message: String,
+    }
+
+    fn diskutil_path() -> String {
+        // test hook of debug builds; never in the elevated helper
+        #[cfg(debug_assertions)]
+        if !super::ELEVATED.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(p) = std::env::var("UMC_DISKUTIL")
+        {
+            return p;
+        }
+        "/usr/sbin/diskutil".into()
+    }
+
+    fn diskutil(args: &[&str]) -> Result<Dictionary, Failure> {
+        let fail = |timed_out, message| Failure { timed_out, message };
+        let out = crate::net::output_timeout(crate::net::command(&diskutil_path()).args(args), DISKUTIL_LIMIT)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    fail(true, format!("diskutil {} did not answer in {} s", args.join(" "), DISKUTIL_LIMIT.as_secs()))
+                } else {
+                    fail(false, format!("could not run diskutil: {e}"))
+                }
+            })?;
         if !out.status.success() {
-            return Err(format!("diskutil {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+            return Err(fail(
+                false,
+                format!("diskutil {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()),
+            ));
         }
         Value::from_reader_xml(&out.stdout[..])
-            .map_err(|e| format!("diskutil output: {e}"))?
+            .map_err(|e| fail(false, format!("diskutil output: {e}")))?
             .into_dictionary()
-            .ok_or_else(|| "diskutil output is not a dictionary".into())
+            .ok_or_else(|| fail(false, "diskutil output is not a dictionary".into()))
     }
 
     fn s<'a>(d: &'a Dictionary, k: &str) -> &'a str {
@@ -134,8 +191,113 @@ mod mac {
         })
     }
 
+    /// A partition of the table: size from the `diskutil list` entry, offset from `diskutil info`, id = the
+    /// volume UUID (else the disk UUID, else empty).
+    pub fn partition_from(entry: &Dictionary, info: Option<&Dictionary>) -> Partition {
+        let from_info = |k| info.map(|i| s(i, k)).unwrap_or("");
+        let id = [s(entry, "VolumeUUID"), from_info("VolumeUUID"), from_info("DiskUUID"), s(entry, "DiskUUID")]
+            .into_iter()
+            .find(|v| !v.is_empty())
+            .unwrap_or("");
+        let size = match n(entry, "Size") {
+            0 => info.map(|i| n(i, "Size")).unwrap_or(0),
+            v => v,
+        };
+        Partition { offset: info.map(|i| n(i, "PartitionMapPartitionOffset")).unwrap_or(0), size, id: id.to_string() }
+    }
+
+    /// Builds one listed disk from the parsed `diskutil` output; `info_of` runs `diskutil info -plist <id>`.
+    /// `Ok(None)`: not a removable drive (or the boot disk). A partition whose `info` fails or times out only leaves the
+    /// drive without a partition table; `Err` is kept for the signature the scan uses (nothing returns it now).
+    pub fn build_disk(
+        id: &str,
+        info: &Dictionary,
+        entries: &[&Dictionary],
+        virtual_shown: bool,
+        info_of: &mut dyn FnMut(&str) -> Result<Dictionary, Failure>,
+    ) -> Result<Option<Disk>, String> {
+        let virt = s(info, "VirtualOrPhysical") == "Virtual";
+        if virt && !virtual_shown {
+            return Ok(None);
+        }
+        let bus = s(info, "BusProtocol").to_string();
+        let removable = b(info, "RemovableMedia") || b(info, "Ejectable");
+        let external = !b(info, "Internal");
+        if !(external || removable || bus == "Secure Digital" || virt) {
+            return Ok(None);
+        }
+        // APFS containers made from another disk are listed as whole disks too: skip them
+        if s(info, "Content").is_empty() && !s(info, "APFSContainerReference").is_empty() {
+            return Ok(None);
+        }
+        let Some(entry) = entries.iter().find(|e| s(e, "DeviceIdentifier") == id) else { return Ok(None) };
+        if entry.get("APFSPhysicalStores").is_some() {
+            return Ok(None);
+        }
+        // a partition whose `diskutil info` fails or keeps timing out leaves this drive without a partition table;
+        // it does not fail the scan of the other drives
+        let mut info_of = |pid: &str| -> Result<Option<Dictionary>, String> { Ok(info_of(pid).ok()) };
+        let mut volumes = Vec::new();
+        let mut partitions = Vec::new();
+        // a partition whose `diskutil info` failed has no offset: the whole table is then unreliable
+        let mut table_complete = true;
+        if let Some(v) = volume(info) {
+            volumes.push(v);
+        }
+        let mut boot = s(info, "MountPoint") == "/";
+        for part in arr(entry, "Partitions") {
+            let pid = s(part, "DeviceIdentifier");
+            let pinfo = info_of(pid)?;
+            table_complete &= pinfo.is_some();
+            partitions.push(partition_from(part, pinfo.as_ref()));
+            if let Some(pinfo) = &pinfo {
+                boot |= s(pinfo, "MountPoint") == "/";
+                volumes.extend(volume(pinfo));
+            }
+            // APFS: the volumes live in a container disk made from this partition
+            for container in
+                entries.iter().filter(|e| arr(e, "APFSPhysicalStores").any(|st| s(st, "DeviceIdentifier") == pid))
+            {
+                for v in arr(container, "APFSVolumes") {
+                    let mount = s(v, "MountPoint");
+                    boot |= mount == "/" || mount.starts_with("/System/Volumes");
+                    if mount.is_empty() || mount.starts_with("/System/Volumes") {
+                        continue;
+                    }
+                    if let Some(vinfo) = info_of(s(v, "DeviceIdentifier"))? {
+                        volumes.extend(volume(&vinfo));
+                    }
+                }
+            }
+        }
+        if boot {
+            return Ok(None);
+        }
+        if !table_complete {
+            // no partition table is better than a wrong one: no limited layout, no record is matched or saved
+            partitions.clear();
+        }
+        let name = match s(info, "MediaName").trim() {
+            "" => s(info, "IORegistryEntryName").trim().to_string(),
+            m => m.to_string(),
+        };
+        Ok(Some(Disk {
+            device: format!("/dev/r{id}"),
+            id: id.to_string(),
+            name: if name.is_empty() { "Drive".into() } else { name },
+            kind: if virt { "other".into() } else { kind_of(&bus).into() },
+            bus,
+            size: n(info, "TotalSize"),
+            block_size: n(info, "DeviceBlockSize").max(512),
+            volumes,
+            partitions,
+            table_unreadable: !table_complete,
+            table_id: String::new(),
+        }))
+    }
+
     pub fn list() -> Result<Vec<Disk>, String> {
-        let all = diskutil(&["list", "-plist"])?;
+        let all = diskutil(&["list", "-plist"]).map_err(|f| f.message)?;
         let entries: Vec<&Dictionary> = arr(&all, "AllDisksAndPartitions").collect();
         let whole: Vec<String> = all
             .get("WholeDisks")
@@ -146,71 +308,13 @@ mod mac {
             .collect();
         let mut disks = Vec::new();
         for id in whole {
-            let Ok(info) = diskutil(&["info", "-plist", &id]) else { continue };
-            let virt = s(&info, "VirtualOrPhysical") == "Virtual";
-            if virt && !show_virtual() {
-                continue;
-            }
-            let bus = s(&info, "BusProtocol").to_string();
-            let removable = b(&info, "RemovableMedia") || b(&info, "Ejectable");
-            let external = !b(&info, "Internal");
-            if !(external || removable || bus == "Secure Digital" || virt) {
-                continue;
-            }
-            // APFS containers made from another disk are listed as whole disks too: skip them
-            if s(&info, "Content").is_empty() && !s(&info, "APFSContainerReference").is_empty() {
-                continue;
-            }
-            let Some(entry) = entries.iter().find(|e| s(e, "DeviceIdentifier") == id) else { continue };
-            if !entry.get("APFSPhysicalStores").is_none() {
-                continue;
-            }
-            let mut volumes = Vec::new();
-            if let Some(v) = volume(&info) {
-                volumes.push(v);
-            }
-            let mut boot = s(&info, "MountPoint") == "/";
-            for part in arr(entry, "Partitions") {
-                let pid = s(part, "DeviceIdentifier");
-                if !s(part, "MountPoint").is_empty()
-                    && let Ok(pinfo) = diskutil(&["info", "-plist", pid])
-                {
-                    boot |= s(&pinfo, "MountPoint") == "/";
-                    volumes.extend(volume(&pinfo));
-                }
-                // APFS: the volumes live in a container disk made from this partition
-                for container in
-                    entries.iter().filter(|e| arr(e, "APFSPhysicalStores").any(|st| s(st, "DeviceIdentifier") == pid))
-                {
-                    for v in arr(container, "APFSVolumes") {
-                        let mount = s(v, "MountPoint");
-                        boot |= mount == "/" || mount.starts_with("/System/Volumes");
-                        if mount.is_empty() || mount.starts_with("/System/Volumes") {
-                            continue;
-                        }
-                        if let Ok(vinfo) = diskutil(&["info", "-plist", s(v, "DeviceIdentifier")]) {
-                            volumes.extend(volume(&vinfo));
-                        }
-                    }
-                }
-            }
-            if boot {
-                continue;
-            }
-            let name = match s(&info, "MediaName").trim() {
-                "" => s(&info, "IORegistryEntryName").trim().to_string(),
-                m => m.to_string(),
+            let info = match diskutil(&["info", "-plist", &id]) {
+                Ok(i) => i,
+                Err(f) if f.timed_out => return Err(f.message),
+                Err(_) => continue,
             };
-            disks.push(Disk {
-                device: format!("/dev/r{id}"),
-                id,
-                name: if name.is_empty() { "Drive".into() } else { name },
-                kind: if virt { "other".into() } else { kind_of(&bus).into() },
-                bus,
-                size: n(&info, "TotalSize"),
-                block_size: n(&info, "DeviceBlockSize").max(512),
-                volumes,
-            });
+            let mut info_of = |pid: &str| diskutil(&["info", "-plist", pid]);
+            disks.extend(build_disk(&id, &info, &entries, show_virtual(), &mut info_of)?);
         }
         Ok(disks)
     }
@@ -229,7 +333,8 @@ pub fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() < 4 && id.bytes().all(|c| c.is_ascii_digit())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
 mod win {
     use super::*;
     use serde::Deserialize;
@@ -242,12 +347,18 @@ foreach ($d in Get-Disk) {
   $bus = [string]$d.BusType
   if (@('USB','SD','MMC','1394') -notcontains $bus) { continue }
   $vols = @()
-  foreach ($p in @(Get-Partition -DiskNumber $d.Number)) {
+  $pe = $null
+  $all = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue -ErrorVariable pe)
+  foreach ($p in $all) {
     if (-not $p.DriveLetter -or $p.DriveLetter -eq [char]0) { continue }
     $v = Get-Volume -Partition $p
     $vols += [pscustomobject]@{ letter = [string]$p.DriveLetter; label = [string]$v.FileSystemLabel; fs = [string]$v.FileSystem; size = [uint64]$v.Size; free = [uint64]$v.SizeRemaining }
   }
-  $out += [pscustomobject]@{ number = [int]$d.Number; name = [string]$d.FriendlyName; bus = $bus; size = [uint64]$d.Size; sector = [uint64]$d.LogicalSectorSize; readonly = [bool]$d.IsReadOnly; vols = $vols }
+  $parts = @()
+  foreach ($p in $all) {
+    $parts += [pscustomobject]@{ offset = [uint64]$p.Offset; size = [uint64]$p.Size }
+  }
+  $out += [pscustomobject]@{ number = [int]$d.Number; name = [string]$d.FriendlyName; bus = $bus; size = [uint64]$d.Size; sector = [uint64]$d.LogicalSectorSize; readonly = [bool]$d.IsReadOnly; vols = $vols; parts = $parts; partsfail = [bool]((@($pe | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' }).Count -gt 0) -or ($all.Count -eq 0 -and $d.NumberOfPartitions -gt 0)); sig = [uint32]$d.Signature; guid = [string]$d.Guid }
 }
 ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
 "#;
@@ -266,6 +377,14 @@ ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
     }
 
     #[derive(Deserialize)]
+    struct PsPart {
+        #[serde(default)]
+        offset: u64,
+        #[serde(default)]
+        size: u64,
+    }
+
+    #[derive(Deserialize)]
     struct PsDisk {
         number: u32,
         #[serde(default)]
@@ -280,22 +399,50 @@ ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
         readonly: bool,
         #[serde(default, deserialize_with = "one_or_many")]
         vols: Vec<PsVol>,
+        #[serde(default, deserialize_with = "one_or_many")]
+        parts: Vec<PsPart>,
+        /// `Get-Partition` reported an error for this disk.
+        #[serde(default)]
+        partsfail: bool,
+        /// MBR disk signature (0 for GPT disks).
+        #[serde(default)]
+        sig: u32,
+        /// GPT disk GUID (empty for MBR disks).
+        #[serde(default)]
+        guid: String,
     }
 
     /// ConvertTo-Json writes a one-element array as a bare object.
-    fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PsVol>, D::Error> {
+    fn one_or_many<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum OneOrMany {
-            One(PsVol),
-            Many(Vec<PsVol>),
+        enum OneOrMany<T> {
+            // an array first: a struct whose fields all have defaults would also accept an empty array as one value
+            Many(Vec<T>),
+            One(T),
             Null(()),
         }
-        Ok(match OneOrMany::deserialize(d)? {
+        Ok(match OneOrMany::<T>::deserialize(d)? {
             OneOrMany::One(v) => vec![v],
             OneOrMany::Many(v) => v,
             OneOrMany::Null(()) => Vec::new(),
         })
+    }
+
+    /// The GPT GUID without braces when the disk has one, else the MBR signature as 8 hex digits, else empty.
+    fn table_id(guid: &str, sig: u32) -> String {
+        let guid = guid.trim().trim_matches(['{', '}']);
+        if !guid.is_empty() {
+            guid.to_string()
+        } else if sig != 0 {
+            format!("{sig:08X}")
+        } else {
+            String::new()
+        }
     }
 
     pub fn parse(json: &str) -> Result<Vec<Disk>, String> {
@@ -307,6 +454,14 @@ ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
         Ok(list
             .into_iter()
             .map(|d| Disk {
+                table_id: table_id(&d.guid, d.sig),
+                // no partitions although the disk has volumes, or a failed `Get-Partition`: the table is unreadable
+                table_unreadable: d.partsfail || (d.parts.is_empty() && !d.vols.is_empty()),
+                partitions: d
+                    .parts
+                    .iter()
+                    .map(|p| Partition { offset: p.offset, size: p.size, id: String::new() })
+                    .collect(),
                 id: d.number.to_string(),
                 device: format!(r"\\.\PhysicalDrive{}", d.number),
                 name: if d.name.trim().is_empty() { "Drive".into() } else { d.name.trim().to_string() },
@@ -327,11 +482,17 @@ ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
             .collect())
     }
 
+    #[cfg(windows)]
     pub fn list() -> Result<Vec<Disk>, String> {
-        let out = crate::net::command("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT])
-            .output()
-            .map_err(|e| format!("could not run PowerShell: {e}"))?;
+        let mut cmd = crate::net::command("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT]);
+        let out = crate::net::output_timeout(&mut cmd, std::time::Duration::from_secs(30)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                "PowerShell did not answer in 30 s".to_string()
+            } else {
+                format!("could not run PowerShell: {e}")
+            }
+        })?;
         parse(&String::from_utf8_lossy(&out.stdout))
     }
 }
@@ -376,17 +537,144 @@ mod tests {
             size: 0,
             block_size: 512,
             volumes: vec![v("/a", 10, true), v("/b", 30, false), v("/c", 20, true)],
+            partitions: Vec::new(),
+            table_unreadable: false,
+            table_id: String::new(),
         };
         assert_eq!(d.main_volume().unwrap().mount, "/c");
     }
 
-    #[cfg(windows)]
     #[test]
     fn powershell_json() {
         let one = r#"[{"number":2,"name":"SanDisk","bus":"USB","size":64000000000,"sector":512,"readonly":false,"vols":{"letter":"E","label":"X","fs":"exFAT","size":63000000000,"free":1000}}]"#;
         let d = win::parse(one).unwrap();
         assert_eq!(d[0].device, r"\\.\PhysicalDrive2");
         assert_eq!(d[0].volumes[0].mount, r"E:\");
+        assert!(d[0].partitions.is_empty());
+        assert_eq!(d[0].table_id, "");
         assert!(win::parse("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn powershell_repaired_mbr_disk() {
+        let json = r#"[{"number":3,"name":"Storage Device","bus":"USB","size":125829120000,"sector":512,"readonly":false,"vols":null,"parts":{"offset":1048576,"size":8303673344},"sig":439041101,"guid":""}]"#;
+        let d = win::parse(json).unwrap();
+        assert_eq!(d[0].table_id, "1A2B3C4D");
+        assert!(d[0].volumes.is_empty());
+        assert_eq!(d[0].partitions, vec![Partition { offset: 1_048_576, size: 8_303_673_344, id: String::new() }]);
+    }
+
+    #[test]
+    fn powershell_unreadable_table_is_flagged() {
+        // Get-Partition failed (partsfail), or the disk has volumes but no partitions were returned
+        let failed = r#"[{"number":1,"bus":"USB","size":1000,"vols":[],"parts":[],"partsfail":true}]"#;
+        assert!(win::parse(failed).unwrap()[0].table_unreadable);
+        let lost = r#"[{"number":1,"bus":"USB","size":1000,"vols":{"letter":"E","size":1,"free":1},"parts":[]}]"#;
+        assert!(win::parse(lost).unwrap()[0].table_unreadable);
+        // a blank disk (RAW, after `clean`, a new card): Get-Partition says "not found", which is not a failure
+        let blank = r#"[{"number":1,"bus":"USB","size":1000,"vols":[],"parts":[],"partsfail":false}]"#;
+        assert!(!win::parse(blank).unwrap()[0].table_unreadable);
+        let blank_no_field = r#"[{"number":1,"bus":"USB","size":1000,"vols":[],"parts":[]}]"#;
+        assert!(!win::parse(blank_no_field).unwrap()[0].table_unreadable);
+        let ok = r#"[{"number":1,"bus":"USB","size":1000,"vols":[],"parts":{"offset":1048576,"size":100}}]"#;
+        assert!(!win::parse(ok).unwrap()[0].table_unreadable);
+    }
+
+    #[test]
+    fn powershell_gpt_guid() {
+        let json = r#"[{"number":4,"bus":"USB","size":1000,"sector":512,"vols":[],"parts":[{"offset":1,"size":2}],"sig":0,"guid":"{0F1E2D3C-0000-4000-8000-00000000ABCD}"}]"#;
+        let d = win::parse(json).unwrap();
+        assert_eq!(d[0].table_id, "0F1E2D3C-0000-4000-8000-00000000ABCD");
+    }
+
+    #[test]
+    fn powershell_parts_one_or_many() {
+        let many =
+            r#"[{"number":1,"bus":"USB","parts":[{"offset":1048576,"size":100},{"offset":2097152,"size":200}]}]"#;
+        let one = r#"[{"number":1,"bus":"USB","parts":{"offset":1048576,"size":100}}]"#;
+        assert_eq!(win::parse(many).unwrap()[0].partitions.len(), 2);
+        assert_eq!(win::parse(one).unwrap()[0].partitions.len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use super::super::mac::*;
+        use super::super::*;
+        use plist::{Dictionary, Value};
+
+        fn load(text: &str) -> Dictionary {
+            Value::from_reader_xml(text.as_bytes()).unwrap().into_dictionary().unwrap()
+        }
+
+        fn fixtures() -> (Dictionary, Dictionary, Dictionary) {
+            (
+                load(include_str!("testdata/disk6-list.plist")),
+                load(include_str!("testdata/disk6-info.plist")),
+                load(include_str!("testdata/disk6s1-info.plist")),
+            )
+        }
+
+        fn entries(list: &Dictionary) -> Vec<&Dictionary> {
+            list.get("AllDisksAndPartitions")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_dictionary)
+                .collect()
+        }
+
+        #[test]
+        fn parses_repaired_disk6_fixture() {
+            let (list, info, pinfo) = fixtures();
+            let mut info_of = |_: &str| Ok(pinfo.clone());
+            let d = build_disk("disk6", &info, &entries(&list), false, &mut info_of).ok().flatten().unwrap();
+            assert_eq!(d.size, 125_829_120_000);
+            assert_eq!(
+                d.partitions,
+                vec![Partition {
+                    offset: 1_048_576,
+                    size: 8_303_673_344,
+                    id: "00000000-0000-4000-8000-000000000001".into()
+                }]
+            );
+            assert_eq!(d.table_id, "");
+            assert_eq!(d.volumes.len(), 1);
+        }
+
+        #[test]
+        fn failed_partition_info_leaves_no_table() {
+            let (list, info, _) = fixtures();
+            let mut info_of =
+                |_: &str| Err(Failure { timed_out: false, message: "could not get disk info".to_string() });
+            let d = build_disk("disk6", &info, &entries(&list), false, &mut info_of).ok().flatten().unwrap();
+            assert!(d.partitions.is_empty());
+            assert!(d.table_unreadable, "an unreadable table is flagged, so nothing known is confirmed");
+        }
+
+        #[test]
+        fn timed_out_partition_info_lists_the_drive_without_a_table() {
+            let (list, info, _) = fixtures();
+            let mut info_of = |_: &str| Err(Failure { timed_out: true, message: "slow".to_string() });
+            let d = build_disk("disk6", &info, &entries(&list), false, &mut info_of).ok().flatten().unwrap();
+            assert!(d.partitions.is_empty(), "no table, so no record is matched or saved");
+            assert!(d.table_unreadable);
+            assert_eq!(d.size, 125_829_120_000);
+        }
+
+        #[test]
+        fn unmounted_partition_still_listed() {
+            let (mut list, info, mut pinfo) = fixtures();
+            // the same entry without a mount point, and info without one too
+            let all = list.get_mut("AllDisksAndPartitions").unwrap().as_array_mut().unwrap();
+            let part = all[0].as_dictionary_mut().unwrap().get_mut("Partitions").unwrap().as_array_mut().unwrap();
+            part[0].as_dictionary_mut().unwrap().remove("MountPoint");
+            pinfo.insert("MountPoint".into(), Value::String(String::new()));
+            let mut info_of = |_: &str| Ok(pinfo.clone());
+            let d = build_disk("disk6", &info, &entries(&list), false, &mut info_of).ok().flatten().unwrap();
+            assert_eq!(d.partitions.len(), 1);
+            assert_eq!(d.partitions[0].offset, 1_048_576);
+            assert!(d.volumes.is_empty());
+        }
     }
 }

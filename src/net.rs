@@ -1,8 +1,10 @@
 //! Сеть через системный `curl` (есть в macOS и в Windows 10+): без своей реализации TLS в программе.
 //! Нужна только для донатов и обновлений; проверка носителей работает без сети.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// Команда без окна консоли в Windows.
 pub fn command(program: &str) -> Command {
@@ -15,6 +17,43 @@ pub fn command(program: &str) -> Command {
         c.creation_flags(CREATE_NO_WINDOW);
     }
     c
+}
+
+/// Runs a command like `Command::output`, but kills it and returns `ErrorKind::TimedOut` when it runs longer
+/// than `limit`. Stdout and stderr are drained in two threads, so a chatty child cannot block on a full pipe.
+pub fn output_timeout(cmd: &mut Command, limit: Duration) -> io::Result<Output> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            // the reader threads end by themselves when the pipes close; a grandchild may keep them open, so no join
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("the command did not finish in {limit:?}")));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
 fn curl() -> Command {
@@ -98,7 +137,7 @@ pub fn cache_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::is_https;
+    use super::*;
 
     #[test]
     fn only_https_links() {
@@ -109,5 +148,23 @@ mod tests {
         assert!(!is_https("javascript:alert(1)"));
         assert!(!is_https("https://a b"));
         assert!(!is_https("https://"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_timeout_returns_output() {
+        let out = output_timeout(Command::new("/bin/echo").arg("hi"), Duration::from_secs(5)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"hi\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_timeout_kills_a_slow_child() {
+        let start = Instant::now();
+        let err = output_timeout(Command::new("/bin/sleep").arg("5"), Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // the point: it returns long before `sleep 5` would (the bound allows a loaded machine)
+        assert!(start.elapsed() < Duration::from_millis(4500));
     }
 }

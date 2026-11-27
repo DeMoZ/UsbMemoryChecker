@@ -28,9 +28,21 @@ macOS (Apple Silicon) and Windows · English, Русский, Español, Deutsch,
 - **Repair.** Rewrites the partition table so the drive has a single partition of its *real* size (exFAT or
   FAT32), with the fake part left unused. After that the drive honestly shows, say, 31.9 GB and stops losing files.
   Afterwards the window offers to run the full check on the repaired drive, to confirm the new size is right.
+  What the app learned about a drive that it repaired is remembered: the result of the last check and the repair are
+  saved per drive in `capacity.json` next to the settings, so a repaired drive still shows "Repaired" after a restart or
+  a replug. (A drive that was only checked, not repaired, is not remembered after a replug or a restart: check it again.)
+  A repaired drive is recognised by its declared size and partition layout, and a drive whose partition ends far before its
+  declared size is recognised as limited even without a saved result. For such a drive the Repair tab proposes the
+  real size it knows (from a check) or the size of its current partition, and the full declared size only if you
+  tick "Use the full declared size". The full declared size is proposed only for a drive that a whole-device check found genuine; for a drive that is not checked yet there is no proposed size (run the quick check, or tick the full size yourself).
 - **Shows free and total space** of the volume, the size the drive declares, and the verified real size.
 - **Safe by design.** Only removable and external drives are listed; internal and system disks never appear. The
-  elevated part checks the drive again (same id, same size) right before touching it.
+  elevated part checks the drive again (same id, same size, same partition layout) right before touching it. The
+  app prefers the safe side: a drive whose partitions end well before its declared size (for example a stick written
+  with `dd` from an ISO image) is shown as "limited" with that size as the proposed repair size, and a small GPT stick
+  partitioned by macOS may show "partition verified" instead of a verified whole device. A quick check settles both. When what the app knew about a drive no longer matches its partitions (another drive took
+  its place, or the layout cannot be read), the header says "Unconfirmed" and the app asks for a quick check before it
+  proposes a repair size.
 - **Updates itself** from GitHub releases (checked once a day, can be turned off) and has a **Support** button.
 
 ![Speed test with the live chart and results](docs/screenshot-speed.png)
@@ -54,7 +66,9 @@ Download the latest release from [Releases](https://github.com/DeMoZ/UsbMemoryCh
 3. **Real capacity** tab: choose **Quick check** (recommended) or **Full check** and press **Check capacity**.
    For the quick check macOS asks for your password, Windows asks for permission.
 4. If the drive turns out fake, press **Repair to …**: choose exFAT or FAT32 and a name, confirm, and the drive gets
-   a partition of its real size. **This erases the drive** — copy your files off it first.
+   a partition of its real size. If the app knows a real size (or the drive already has a smaller partition) that is
+   the proposed size, and the full declared size is used only if you tick **Use the full declared size**; a drive that
+   is genuine is proposed its full size, and one that is not checked yet gets no proposal until you run the quick check or tick the full size yourself. **This erases the drive** — copy your files off it first.
 
 ## How the quick check works
 
