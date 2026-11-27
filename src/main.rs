@@ -191,14 +191,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[allow(unused_mut)]
     let mut builder = WindowBuilder::new()
         .with_title("UsbMemoryChecker")
-        .with_inner_size(tao::dpi::LogicalSize::new(1180.0, 800.0))
-        .with_min_inner_size(tao::dpi::LogicalSize::new(880.0, 620.0));
+        .with_inner_size(tao::dpi::LogicalSize::new(1180.0, 760.0))
+        .with_min_inner_size(tao::dpi::LogicalSize::new(880.0, 600.0));
     #[cfg(target_os = "macos")]
     {
         use tao::platform::macos::WindowBuilderExtMacOS;
         builder = builder.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true);
     }
     let window = builder.build(&event_loop)?;
+    // tao leaves the window class without an icon: take the .exe icon (resource 1, see build.rs) for the title bar
+    // (small) and the taskbar and Alt+Tab (big) at the display's scale; without the resource the window stays as is
+    #[cfg(windows)]
+    {
+        use tao::platform::windows::{IconExtWindows, WindowExtWindows};
+        let px = |dip: f64| {
+            let p = (dip * window.scale_factor()).round() as u32;
+            Some(tao::dpi::PhysicalSize::new(p, p))
+        };
+        window.set_window_icon(tao::window::Icon::from_resource(1, px(16.0)).ok());
+        window.set_taskbar_icon(tao::window::Icon::from_resource(1, px(32.0)).ok());
+    }
 
     let ipc_state = Arc::clone(&state);
     let ipc_ui = ui.clone();
