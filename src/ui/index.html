@@ -121,7 +121,8 @@ select.pill-btn option { background: var(--bg-2); color: var(--text); }
 .icon-btn { width: 30px; height: 30px; border-radius: 10px; display: grid; place-items: center; border: 1px solid transparent; background: transparent; color: var(--text-3); cursor: pointer; transition: .18s; }
 .icon-btn:hover { background: var(--glass-2); color: var(--text); border-color: var(--line); }
 .icon-btn svg { width: 15px; height: 15px; }
-.icon-btn.spin svg { animation: spin .8s linear; }
+.icon-btn.busy svg { animation: spin .8s linear infinite; }
+.icon-btn.busy { opacity: .7; cursor: default; }
 .drive-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding: 2px; margin: -2px; }
 .drive {
   position: relative; display: grid; grid-template-columns: 42px 1fr; gap: 12px; align-items: center; text-align: left;
@@ -477,6 +478,7 @@ tr:last-child td { border-bottom: 0; }
             <button class="btn btn-primary btn-big" id="capBtn" onclick="startCapacity()"><svg><use href="#i-play"/></svg><span data-i18n="btnCheck"></span></button>
           </div>
           <div class="progress" id="prog-capacity"></div>
+          <div class="note" id="capNote" style="display:none"><svg><use href="#i-info"/></svg><span id="capNoteText"></span></div>
           <div class="verdict" id="verdict"></div>
         </div>
 
@@ -491,7 +493,11 @@ tr:last-child td { border-bottom: 0; }
             <div class="field"><span class="label" data-i18n="repFs"></span><div class="seg" id="fsSeg"><button data-fs="exfat" onclick="setFs('exfat')">exFAT</button><button data-fs="fat32" onclick="setFs('fat32')">FAT32</button></div><span class="h" data-i18n="repFsHint"></span></div>
             <div class="field"><span class="label" data-i18n="repLabel"></span><input class="input" id="repLabel" maxlength="11" value="USB" spellcheck="false" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9_-]/g,'')"><span class="h" data-i18n="repLabelHint"></span></div>
           </div>
-          <div class="note" id="repNote" style="display:none"><svg><use href="#i-info"/></svg><span data-i18n="repNeedCheck"></span></div>
+          <div class="note" id="repNote" style="display:none"><svg><use href="#i-info"/></svg><span id="repNoteText"></span></div>
+          <div id="repWholeBox" style="display:none;flex-direction:column;gap:8px">
+            <label class="check"><input type="checkbox" id="repWhole" onchange="renderRepair()"><span id="repWholeText"></span></label>
+            <div class="note" id="repWholeWarnBox" style="display:none"><svg><use href="#i-alert"/></svg><span id="repWholeWarnText"></span></div>
+          </div>
           <label class="check"><input type="checkbox" id="repConfirm" onchange="renderRepair()"><span id="repConfirmText"></span></label>
           <div class="row">
             <div style="flex:1"></div>
@@ -589,7 +595,9 @@ let appVersion = '0.0.0', canUpdate = false, platform = 'macos', fat32Max = 32e9
 let speedSizes = [100, 1000, 5000], speedMb = 1000, capMode = 'quick', fs = 'exfat';
 let disks = [], disksLoaded = false, selected = null, tab = 'speed';
 let task = null;            // {kind, disk, fraction, stage, mbps, started}
-const results = {};         // disk id -> {speed: [], capacity: {...}, repaired: size}
+const results = {};         // disk id -> {speed: [], repaired: size, ...}: what only this window knows
+let capacity = {};          // disk id -> capacity view worked out by Rust (state, check, repair plan)
+let rescanSeq = 0, rescanPending = 0, rescanTimer = null;
 let series = { write: [], read: [] }, seriesDisk = null, seriesKind = null;
 let update = { checking: false, downloading: false, available: null, writable: false, status: null };
 
@@ -654,15 +662,36 @@ function applyLanguage() {
 }
 
 // ============================================================ drives
+// Reload: Rust answers every request with a drive list; until then the button is busy and a second press does nothing
 function rescan() {
+  if (rescanPending) return;
   const b = $('rescanBtn');
-  b.classList.remove('spin'); void b.offsetWidth; b.classList.add('spin');
-  send('rescan');
+  rescanPending = ++rescanSeq;
+  b.classList.add('busy');
+  b.disabled = true;
+  rescanTimer = setTimeout(() => {
+    if (!rescanPending) return;
+    clearRescan();
+    toast(t('rescanSlow'), 'info', 8000);
+  }, 20000);
+  send('rescan', { seq: rescanSeq });
+}
+function clearRescan() {
+  rescanPending = 0;
+  clearTimeout(rescanTimer);
+  const b = $('rescanBtn');
+  b.classList.remove('busy');
+  b.disabled = false;
+}
+function selectDrive(id) {
+  if (selected !== id) $('repWhole').checked = false;
+  selected = id;
 }
 
 function driveIcon(kind) { return kind === 'sd' ? 'sd' : kind === 'usb' ? 'usb' : 'ssd'; }
 function volOf(d) { return d.volumes.filter(v => v.writable).sort((a, b) => b.total - a.total)[0] || d.volumes[0] || null; }
-function res(id) { return results[id] || (results[id] = { speed: [], capacity: null, repaired: 0 }); }
+function res(id) { return results[id] || (results[id] = { speed: [], repaired: 0 }); }
+function cap(id) { return capacity[id] || null; }
 function current() { return disks.find(d => d.id === selected) || null; }
 
 function renderDrives() {
@@ -680,7 +709,7 @@ function renderDrives() {
       <div style="min-width:0"><div class="drive-name">${esc(d.name)}</div><div class="drive-sub num">${esc(sub)}</div>
       <div class="mini-bar"><i style="width:${v ? used : 0}%"></i></div></div>
       ${task && task.disk === d.id ? '<span class="busy-dot"></span>' : ''}`;
-    b.onclick = () => { selected = d.id; renderAll(); };
+    b.onclick = () => { selectDrive(d.id); renderAll(); };
     list.appendChild(b);
   }
 }
@@ -704,14 +733,21 @@ function renderDriveView() {
   $('ringArc').style.opacity = used > 0.002 ? 1 : 0;
   $('ringPct').textContent = v ? nf(used * 100, 0) + '%' : '–';
 
-  const c = res(d.id).capacity;
+  const c = cap(d.id);
+  const state = c ? c.state : 'unknown';
   const box = $('mRealBox');
   box.className = 'metric';
-  if (!c) { $('mReal').textContent = t('realUnknown'); $('mRealHint').textContent = t('realUnknownHint'); }
-  else if (c.verdict === 'genuine') { box.classList.add('ok'); $('mReal').textContent = fmtBytes(c.real); $('mRealHint').textContent = t('realOk'); }
-  else if (c.verdict === 'broken') { box.classList.add('bad'); $('mReal').textContent = '0'; $('mRealHint').textContent = t('verdictBroken'); }
-  else { box.classList.add(c.verdict === 'damaged' ? 'warn' : 'bad'); $('mReal').textContent = fmtBytes(c.real); $('mRealHint').textContent = c.verdict === 'damaged' ? t('realDamaged') : t('realFake'); }
-  document.querySelector('.tab[data-tab=capacity]').classList.toggle('alert', !!c && c.verdict !== 'genuine');
+  const setReal = (cls, value, hint) => { if (cls) box.classList.add(cls); $('mReal').textContent = value; $('mRealHint').textContent = hint; };
+  if (state === 'genuine') setReal('ok', fmtBytes(c.value), t('realOk'));
+  else if (state === 'fake') setReal('bad', fmtBytes(c.value), t('realFake'));
+  else if (state === 'damaged') setReal('warn', fmtBytes(c.value), t('realDamaged'));
+  else if (state === 'broken') setReal('bad', '0', t('verdictBroken'));
+  else if (state === 'repaired') setReal('ok', fmtBytes(c.value), c.verified ? t('realRepairedOk') : t('realRepaired'));
+  else if (state === 'partitionOk') setReal('ok', fmtBytes(c.value), t('realPartOk'));
+  else if (state === 'limited') setReal('warn', fmtBytes(c.value), t('realLimited', { size: fmtBytes(c.declared) }));
+  else if (state === 'unconfirmed') setReal('warn', t('realUnconfirmed'), t('realUnconfirmedHint'));
+  else setReal('', t('realUnknown'), t('realUnknownHint'));
+  document.querySelector('.tab[data-tab=capacity]').classList.toggle('alert', ['fake', 'damaged', 'broken', 'limited', 'unconfirmed'].includes(state));
 }
 
 // ============================================================ tabs
@@ -862,31 +898,45 @@ function startCapacity() {
 function renderVerdict() {
   const el = $('verdict');
   const d = current();
-  const c = d && res(d.id).capacity;
-  if (!c) { el.className = 'verdict'; el.innerHTML = ''; return; }
-  const cls = { genuine: 'ok', fake: 'bad', damaged: 'warn', broken: 'bad' }[c.verdict];
-  const ic = { genuine: 'shield', fake: 'x', damaged: 'alert', broken: 'x' }[c.verdict];
+  const c = d && cap(d.id);
+  // a drive with a limited layout: say what is tested by which check
+  const noteOn = !!c && c.partition > 0;
+  $('capNote').style.display = noteOn ? 'flex' : 'none';
+  if (noteOn) $('capNoteText').textContent = t('capLimitedNote', { part: fmtBytes(c.partition), free: fmtBytes(c.unused) });
+  const k = c && c.check;
+  if (!k) { el.className = 'verdict'; el.innerHTML = ''; return; }
+  let cls = { genuine: 'ok', fake: 'bad', damaged: 'warn', broken: 'bad' }[k.verdict];
+  const ic = { genuine: 'shield', fake: 'x', damaged: 'alert', broken: 'x' }[k.verdict];
   let title, text;
-  if (c.mode === 'full') {
-    title = c.verdict === 'genuine' ? t('verdictGenuine') : t('verdictLoses');
-    text = c.verdict === 'genuine' ? t('fullOk', { tested: fmtBytes(c.tested) })
-      : t('fullBad', { bad: fmtBytes(c.bad), tested: fmtBytes(c.tested), real: fmtBytes(c.real) });
-    if (c.verdict === 'broken') text += ' ' + t('errBroken');
-    if (c.stoppedEarly && c.verdict !== 'genuine') text += ' ' + t('fullStoppedEarly');
-    if (c.writeError) text += ' ' + t('fullWriteError', { err: c.writeError });
+  if (k.mode === 'full') {
+    if (k.verdict === 'genuine' && k.scope === 'partition') {
+      title = t('verdictPartitionOk');
+      text = t('fullPartOk', { tested: fmtBytes(k.tested), part: fmtBytes(k.real), size: fmtBytes(k.declared) });
+      if (k.cutShort && !k.writeError) text += ' ' + t('fullCutShort');
+      if (k.nearlyFull) { title = t('capTitle'); text = t('fullUsedVolume'); cls = 'warn'; }
+    } else {
+      title = k.verdict === 'genuine' ? t('verdictGenuine') : t('verdictLoses');
+      text = k.verdict === 'genuine' ? t('fullOk', { tested: fmtBytes(k.tested) })
+        : t('fullBad', { bad: fmtBytes(k.bad), tested: fmtBytes(k.tested), real: fmtBytes(k.real) });
+    }
+    if (k.verdict === 'broken') text += ' ' + t('errBroken');
+    if (k.stoppedEarly && k.verdict !== 'genuine') text += ' ' + t('fullStoppedEarly');
+    if (k.writeError) text += ' ' + t('fullWriteError', { err: k.writeError });
   } else {
-    const key = { genuine: 'verdictGenuine', fake: 'verdictFake', damaged: 'verdictDamaged', broken: 'verdictBroken' }[c.verdict];
+    const key = { genuine: 'verdictGenuine', fake: 'verdictFake', damaged: 'verdictDamaged', broken: 'verdictBroken' }[k.verdict];
     title = t(key);
-    text = t(key + 'Text', { real: fmtBytes(c.real), size: fmtBytes(c.reported), n: nf(c.points, 0) });
+    text = t(key + 'Text', { real: fmtBytes(k.real), size: fmtBytes(k.declared), n: nf(k.points, 0) });
   }
   let split = '';
-  if (c.verdict === 'fake' || c.verdict === 'damaged') {
-    const pct = Math.max(4, Math.min(96, c.real / c.reported * 100));
-    split = `<div class="split num"><div class="r" style="width:${pct}%">${esc(t('realPart', { v: fmtBytes(c.real) }))}</div><div class="f">${esc(t('fakePart', { v: fmtBytes(Math.max(0, c.reported - c.real)) }))}</div></div>`;
+  if (k.verdict === 'fake' || k.verdict === 'damaged') {
+    const pct = Math.max(4, Math.min(96, k.real / k.declared * 100));
+    split = `<div class="split num"><div class="r" style="width:${pct}%">${esc(t('realPart', { v: fmtBytes(k.real) }))}</div><div class="f">${esc(t('fakePart', { v: fmtBytes(Math.max(0, k.declared - k.real)) }))}</div></div>`;
   }
-  const action = (c.verdict === 'fake' || c.verdict === 'damaged') && c.real > 0
-    ? `<div class="actions"><button class="btn btn-danger" onclick="showTab('repair')">${icon('wrench')}${esc(t('btnRepairTo', { size: fmtBytes(c.repairSize) }))}</button></div>` : '';
-  const faint = [c.seconds ? t('checkedIn', { time: fmtTime(c.seconds) }) : '', c.restoreFailures ? t('restoreFailures', { n: c.restoreFailures }) : ''].filter(Boolean).join(' · ');
+  const canRepair = (c.state === 'fake' || c.state === 'damaged') && c.repair.limit > 0;
+  const action = canRepair
+    ? `<div class="actions"><button class="btn btn-danger" onclick="showTab('repair')">${icon('wrench')}${esc(t('btnRepairTo', { size: fmtBytes(c.repair.limit) }))}</button></div>` : '';
+  const when = c.remembered && k.at ? t('capRemembered', { date: new Date(k.at * 1000).toLocaleDateString(LOCALE[lang] || 'en-US') }) : '';
+  const faint = [k.seconds ? t('checkedIn', { time: fmtTime(k.seconds) }) : '', when, k.restoreFailures ? t('restoreFailures', { n: k.restoreFailures }) : ''].filter(Boolean).join(' · ');
   el.className = 'verdict on ' + cls;
   el.innerHTML = `<div class="vi">${icon(ic)}</div><div><h4>${esc(title)}</h4><p>${esc(text)}</p>${split}${faint ? `<div class="faint">${esc(faint)}</div>` : ''}${action}</div>`;
 }
@@ -894,22 +944,49 @@ function renderVerdict() {
 // ============================================================ repair
 function setFs(v) { fs = v; renderRepair(); }
 
+// The plan comes from Rust (the capacity view): the window only picks between the default and the full size.
 function repairPlan() {
   const d = current();
   if (!d) return null;
-  const c = res(d.id).capacity;
-  const shrink = c && (c.verdict === 'fake' || c.verdict === 'damaged') && c.real > 0;
-  return { d, c, shrink, size: shrink ? c.repairSize : d.size };
+  const c = cap(d.id);
+  const r = c ? c.repair : { default: 'none', limit: null, whole: d.size };
+  const state = c ? c.state : 'unknown';
+  // the full declared size is a default only for a drive found genuine; otherwise it is the user's explicit choice
+  const offerWhole = r.default !== 'whole' && state !== 'broken' && state !== 'unconfirmed';
+  const whole = offerWhole && $('repWhole').checked;
+  let plan = r.default, size = r.default === 'limit' ? r.limit : r.whole;
+  if (whole) { plan = 'whole'; size = r.whole; }
+  return { d, c, r, state, plan, size, offerWhole, whole };
 }
 
 function renderRepair() {
   const p = repairPlan();
   if (!p) return;
-  const { d, c, shrink, size } = p;
-  $('repLead').textContent = shrink ? t('repText', { size: fmtBytes(size) }) : t('repTextFull', { size: fmtBytes(size) });
-  $('repSize').textContent = fmtBytes(size);
-  $('repSizeHint').textContent = shrink ? t('repSizeFrom', { size: fmtBytes(d.size) }) : t('repSizeFull');
-  $('repNote').style.display = c ? 'none' : 'flex';
+  const { d, c, r, state, plan, size, offerWhole, whole } = p;
+  const keyOf = { fake: 'repText', damaged: 'repText', repaired: 'repTextLimit', partitionOk: 'repTextLimit', limited: 'repTextLimit' };
+  const sizeArgs = { size: fmtBytes(size), real: fmtBytes(c && c.lossReal != null ? c.lossReal : (r.limit || 0)) };
+  if (plan === 'none') $('repLead').textContent = state === 'unconfirmed' ? t('errUnconfirmed') : state === 'broken' ? t('errBroken') : t('errNoPlan');
+  else if (whole && (state === 'fake' || state === 'damaged' || state === 'repaired')) $('repLead').textContent = t('repWholeLeadFake', sizeArgs);
+  else if (whole && state === 'limited') $('repLead').textContent = t('repWholeLeadLimited', sizeArgs);
+  else if (whole && state === 'partitionOk') $('repLead').textContent = t('repWholeLeadVerified', sizeArgs);
+  else if (whole && state === 'unknown') $('repLead').textContent = t('repWholeLeadUnknown', sizeArgs);
+  else if (!whole && keyOf[state] === 'repText') $('repLead').textContent = t('repText', { size: fmtBytes(size) });
+  else if (!whole && state === 'limited') $('repLead').textContent = t('repTextLimited', { size: fmtBytes(size) });
+  else if (!whole && keyOf[state] === 'repTextLimit') $('repLead').textContent = t('repTextLimit', { size: fmtBytes(size) });
+  else $('repLead').textContent = t('repTextFull', { size: fmtBytes(size) });
+  $('repSize').textContent = plan === 'none' ? '–' : fmtBytes(size);
+  $('repSizeHint').textContent = plan === 'none' ? '' : size < d.size ? t('repSizeFrom', { size: fmtBytes(d.size) }) : t('repSizeFull');
+  const note = state === 'unknown' ? 'repNeedCheck' : (state === 'limited' && plan !== 'none') ? 'repLimitedNote' : '';
+  $('repNote').style.display = note ? 'flex' : 'none';
+  if (note) $('repNoteText').textContent = state === 'unknown' ? t('repNeedCheck') : t('repLimitedNote');
+  $('repWholeBox').style.display = offerWhole ? 'flex' : 'none';
+  if (offerWhole) {
+    $('repWholeText').textContent = r.default === 'limit' ? t('repWhole', { size: fmtBytes(r.whole) }) : t('repWholeUnknown', { size: fmtBytes(r.whole) });
+    $('repWhole').disabled = !!task;
+    // the warning about a known limit only where there is one; an unchecked drive gets the neutral lead text only
+    $('repWholeWarnBox').style.display = whole && r.default === 'limit' ? 'flex' : 'none';
+    $('repWholeWarnText').textContent = (state === 'limited' || (state === 'partitionOk' && c.lossReal == null)) ? t('repWholeWarnLimited', { size: fmtBytes(r.limit) }) : t('repWholeWarn', { real: fmtBytes(c && c.lossReal != null ? c.lossReal : r.limit) });
+  }
   const fatOk = size <= fat32Max;
   if (!fatOk && fs === 'fat32') fs = 'exfat';
   document.querySelectorAll('#fsSeg button').forEach(b => {
@@ -917,14 +994,7 @@ function renderRepair() {
     b.disabled = !!task || (b.dataset.fs === 'fat32' && !fatOk);
   });
   $('repConfirmText').textContent = t('repConfirm', { name: d.name });
-  const broken = c && c.verdict === 'broken';
-  if (broken) {
-    // the drive keeps nothing: no size to offer, say so instead of "formatted at its full size"
-    $('repLead').textContent = t('errBroken');
-    $('repSize').textContent = '–';
-    $('repSizeHint').textContent = '';
-  }
-  $('repBtn').disabled = !!task || !$('repConfirm').checked || broken;
+  $('repBtn').disabled = !!task || !$('repConfirm').checked || plan === 'none';
   const done = res(d.id).repaired;
   $('repDone').classList.toggle('on', !!done);
   $('repDoneText').textContent = done ? t('repDone', { size: fmtBytes(done) }) : '';
@@ -970,23 +1040,31 @@ function verifyRepaired() {
   renderAll();
 }
 
+let askedRepair = null;   // the plan the confirmation dialog named: this is what is sent
 function askRepair() {
   const p = repairPlan();
-  if (!p) return;
+  if (!p || p.plan === 'none') return;
+  askedRepair = { disk: p.d.id, diskSize: p.d.size, plan: p.plan, size: p.size, whole: !!p.whole, shownState: p.state, shownLimit: p.r.limit, layoutKey: p.c ? p.c.layoutKey : '', fs, label: $('repLabel').value || 'USB' };
   $('repAskText').textContent = t('repAskText', { name: p.d.name, size: fmtBytes(p.size), fs: fs === 'fat32' ? 'FAT32' : 'exFAT' });
   openModal('repairModal');
 }
 
 function doRepair() {
   closeModal('repairModal');
-  if (!selected) return;
-  const r = res(selected), d = current();
+  // exactly what the dialog named, for the drive it was opened for; without it nothing is sent
+  const asked = askedRepair;
+  askedRepair = null;
+  if (!asked) return;
+  const d = disks.find(x => x.id === asked.disk);
+  if (!d) { toast(t('errNoDisk'), 'err', 8000); return; }
+  if (d.size !== asked.diskSize) { toast(t('errRepairChanged'), 'err', 8000); return; }
+  const r = res(d.id);
   r.repaired = 0;
   r.offer = false;
   r.unmountedSeen = false;
-  r.oldVolumes = d ? d.volumes.map(volumeKey) : [];
-  r.diskSize = d ? d.size : 0;
-  send('fix', { disk: selected, fs, label: $('repLabel').value || 'USB' });
+  r.oldVolumes = d.volumes.map(volumeKey);
+  r.diskSize = d.size;
+  send('fix', { disk: d.id, fs: asked.fs, label: asked.label, plan: asked.plan, size: asked.size, whole: asked.whole, shown_state: asked.shownState, shown_limit: asked.shownLimit, layout: asked.layoutKey });
 }
 
 // ============================================================ messages from Rust
@@ -1012,19 +1090,12 @@ function taskDone(msg) {
     r.speed.push(msg.result);
     toast(t('doneSpeed', { w: fmtSpeed(msg.result.speed.write.avg), r: fmtSpeed(msg.result.speed.read.avg) }), 'ok');
   } else if (kind === 'probe') {
-    const o = msg.result.probe;
-    r.capacity = { mode: 'quick', verdict: o.verdict, real: o.verdict === 'genuine' ? o.reported : o.real, reported: o.reported,
-      points: o.points, seconds: o.seconds, restoreFailures: o.restoreFailures, repairSize: repairSize(o.real, o.reported) };
-    toast(t(o.verdict === 'genuine' ? 'verdictGenuine' : o.verdict === 'fake' ? 'verdictFake' : o.verdict === 'damaged' ? 'verdictDamaged' : 'verdictBroken'), o.verdict === 'genuine' ? 'ok' : 'err');
+    // the verdict itself comes from Rust (the `disks` message right after this one); the toast names it
+    const v = msg.result.check.verdict;
+    toast(t(v === 'genuine' ? 'verdictGenuine' : v === 'fake' ? 'verdictFake' : v === 'damaged' ? 'verdictDamaged' : 'verdictBroken'), v === 'genuine' ? 'ok' : 'err');
   } else if (kind === 'full') {
-    const o = msg.result.full, reported = msg.result.reported;
-    // same as run_full in main.rs: 1% below the estimate
-    const real = o.bad > 0 ? Math.floor(Math.min(o.realEstimate, reported) / 100) * 99 : reported;
-    // a drive that keeps nothing (real 0) cannot be repaired: run_fix refuses it with errBroken
-    const verdict = o.bad === 0 ? 'genuine' : real > 0 ? 'fake' : 'broken';
-    r.capacity = { mode: 'full', verdict, real, reported, tested: o.tested, bad: o.bad, writeError: o.writeError, stoppedEarly: o.stoppedEarly,
-      seconds: o.write.seconds + o.read.seconds, repairSize: repairSize(real, reported) };
-    toast(verdict === 'genuine' ? t('verdictGenuine') : t('verdictLoses'), verdict === 'genuine' ? 'ok' : 'err');
+    const k = msg.result.check;
+    toast(k.verdict === 'genuine' ? t(k.scope === 'partition' ? 'verdictPartitionOk' : 'verdictGenuine') : t('verdictLoses'), k.verdict === 'genuine' ? 'ok' : 'err');
   } else if (kind === 'fix') {
     r.repaired = msg.result.size;
     r.repairedAt = Date.now();
@@ -1032,18 +1103,12 @@ function taskDone(msg) {
     setTimeout(renderRepair, VERIFY_SETTLE_MS + 200);
     setTimeout(renderRepair, VERIFY_SLOW_SETTLE_MS + 200);
     setTimeout(renderRepair, VERIFY_GIVE_UP_MS + 200);
-    r.capacity = null;
     $('repConfirm').checked = false;
     toast(t('repDone', { size: fmtBytes(msg.result.size) }), 'ok', 8000);
   }
+  // whatever the result, the next plan comes from the new state
+  if (kind === 'fix') $('repWhole').checked = false;
   renderAll();
-}
-
-// same as helper::partition_size
-function repairSize(real, reported) {
-  if (!real || real >= reported) return reported;
-  const mib = 1 << 20;
-  return Math.floor(Math.max(0, real - 2 * mib) / mib) * mib;
 }
 
 function fmtArgs(a) {
@@ -1070,12 +1135,20 @@ window.onRustMessage = function (msg) {
       break;
     case 'disks':
       disks = msg.disks || [];
+      {
+        // the full-size tick belongs to the state it was made in: a new state or plan clears it
+        const planKey = c => c ? [c.state, c.repair.default, c.repair.limit, c.repair.whole, c.layoutKey].join('|') : '';
+        const before = planKey(capacity[selected]);
+        capacity = msg.capacity || {};
+        if (before !== planKey(capacity[selected])) $('repWhole').checked = false;
+      }
       disksLoaded = disksLoaded || !!msg.scanned;
-      if (!disks.some(d => d.id === selected)) selected = task ? task.disk : (disks[0] ? disks[0].id : null);
-      if (selected && !disks.some(d => d.id === selected)) selected = disks[0] ? disks[0].id : null;
+      if (rescanPending && msg.rescanned >= rescanPending) clearRescan();
+      if (msg.stale) toast(t('errRescan', { err: msg.error || '' }), 'err', 9000);
+      if (!disks.some(d => d.id === selected)) selectDrive(task ? task.disk : (disks[0] ? disks[0].id : null));
+      if (selected && !disks.some(d => d.id === selected)) selectDrive(disks[0] ? disks[0].id : null);
       for (const id of Object.keys(results)) {
         const d = disks.find(x => x.id === id);
-        if (d && results[id].capacity && results[id].capacity.reported !== d.size) results[id].capacity = null;
         const r = results[id];
         // the repair result is only about this very drive: gone or another size, no offer any more
         if (r.repaired && (!d || (r.diskSize && d.size !== r.diskSize))) { r.repaired = 0; r.offer = false; }
@@ -1119,6 +1192,7 @@ window.onRustMessage = function (msg) {
     case 'update':
       update = msg;
       renderUpdate();
+      renderProgress();   // the offer after a repair is disabled while an update downloads
       break;
     case 'update_offer':
       openModal('updateModal');

@@ -46,6 +46,20 @@ pub struct Job {
     /// Fix: bytes for the new partition (0 or ≥ size — the whole drive).
     #[serde(default)]
     pub real: u64,
+    /// Fix: exact bytes for the new partition (a whole number of MiB). 0 = derive the size from `real`.
+    #[serde(default)]
+    pub partition: u64,
+    /// The partition layout Rust saw when it planned the job (its own list, taken after the window's `layoutKey` was
+    /// checked against it by `capacity::check_fix`'s caller). The helper compares it with the drive it finds before it
+    /// touches it, so a drive swapped while the password window was open is refused (None: no check, as the command
+    /// line).
+    #[serde(default)]
+    pub layout: Option<crate::capacity::Fingerprint>,
+    /// Fix: a format at the full declared size was confirmed (set only by Rust: a drive found genuine by a
+    /// whole-device check, or the user's explicit tick; the command line's whole-drive request sets it too). The helper
+    /// refuses an `eraseDisk` / full-size `diskpart` without it, whatever else the job says.
+    #[serde(default)]
+    pub whole_confirmed: bool,
     #[serde(default = "default_fs")]
     pub fs: Fs,
     #[serde(default)]
@@ -71,6 +85,33 @@ pub fn partition_size(real: u64, reported: u64) -> u64 {
     real.saturating_sub(2 << 20) / (1 << 20) * (1 << 20)
 }
 
+const MIB: u64 = 1 << 20;
+
+/// Size of the partition the repair creates, or the reason it must not run. Checked before anything is touched.
+/// With `partition > 0` it must be a whole number of MiB (or the whole drive), at least 1 MiB and at most the
+/// drive's size. Otherwise it is `partition_size(real, size)`, which must not be 0 (a drive that keeps nothing).
+pub fn fix_size(job: &Job) -> Result<u64, String> {
+    if job.partition > 0 {
+        if job.partition > job.size {
+            return Err(format!(
+                "the partition ({} bytes) is larger than the drive ({} bytes)",
+                job.partition, job.size
+            ));
+        }
+        if job.partition < MIB {
+            return Err("the partition is smaller than 1 MiB".into());
+        }
+        if job.partition != job.size && !job.partition.is_multiple_of(MIB) {
+            return Err("the partition size must be a whole number of MiB".into());
+        }
+        return Ok(job.partition);
+    }
+    match partition_size(job.real, job.size) {
+        0 => Err("the drive keeps no usable space; nothing to partition".into()),
+        n => Ok(n),
+    }
+}
+
 // ------------------------------------------------------------------ the helper side (elevated)
 
 fn write_json(path: &Path, v: &Value) {
@@ -82,6 +123,7 @@ fn write_json(path: &Path, v: &Value) {
 
 /// Entry of `--helper <folder>`; returns the process exit code.
 pub fn main(dir: &Path) -> i32 {
+    disks::set_elevated();
     let result = std::fs::read(dir.join("job.json"))
         .map_err(|e| format!("could not read the job: {e}"))
         .and_then(|d| serde_json::from_slice::<Job>(&d).map_err(|e| format!("bad job: {e}")))
@@ -95,11 +137,26 @@ pub fn main(dir: &Path) -> i32 {
     if ok { 0 } else { 1 }
 }
 
+/// The drive found again must have the partition layout the window saw (a drive swapped while the password window
+/// was open has another one).
+fn check_layout(job: &Job, disk: &Disk) -> Result<(), String> {
+    match &job.layout {
+        Some(layout) if &crate::capacity::Fingerprint::of(disk) != layout => {
+            Err("the drive changed since you chose it (its partitions are not the same); choose it again".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn run_job(job: &Job, dir: &Path) -> Result<Value, String> {
     if !disks::valid_id(&job.disk) {
         return Err(format!("bad drive id {:?}", job.disk));
     }
     let disk = disks::find(&job.disk, job.size)?;
+    check_layout(job, &disk)?;
+    if job.action == Action::Fix && disk.table_unreadable {
+        return Err("the partition table of the drive could not be read; look at the drive again".into());
+    }
     let cancel_file = dir.join("cancel");
     let progress_file = dir.join("progress.json");
     let cancel = AtomicBool::new(false);
@@ -178,14 +235,12 @@ fn run_probe(_: &Disk, _: &AtomicBool, _: &mut probe::Progress) -> Result<Value,
 }
 
 /// diskutil arguments for the repair (tested without running them).
-#[cfg_attr(windows, allow(dead_code))]
-pub fn mac_fix_args(disk: &str, job: &Job) -> Vec<String> {
+pub fn mac_fix_args(disk: &str, job: &Job, size: u64) -> Vec<String> {
     let fs = match job.fs {
         Fs::Exfat => "ExFAT",
         Fs::Fat32 => "FAT32",
     };
     let label = clean_label(&job.label);
-    let size = partition_size(job.real, job.size);
     if size >= job.size {
         ["eraseDisk", fs, &label, "MBR", disk].map(String::from).to_vec()
     } else {
@@ -198,12 +253,11 @@ pub fn mac_fix_args(disk: &str, job: &Job) -> Vec<String> {
 
 /// diskpart script for the repair (tested without running it).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn diskpart_script(number: &str, job: &Job) -> String {
+pub fn diskpart_script(number: &str, job: &Job, size: u64) -> String {
     let fs = match job.fs {
         Fs::Exfat => "exfat",
         Fs::Fat32 => "fat32",
     };
-    let size = partition_size(job.real, job.size);
     let create = if size >= job.size {
         "create partition primary".to_string()
     } else {
@@ -216,21 +270,33 @@ pub fn diskpart_script(number: &str, job: &Job) -> String {
     )
 }
 
-fn run_fix(disk: &Disk, job: &Job) -> Result<String, String> {
-    if job.fs == Fs::Fat32 && partition_size(job.real, job.size) > FAT32_MAX {
+/// Everything the repair needs to know before it touches the drive: the partition size and the macOS
+/// `diskutil` arguments. Errors here mean nothing has been unmounted, cleaned or partitioned.
+pub fn plan_fix(disk_id: &str, job: &Job) -> Result<(u64, Vec<String>), String> {
+    let size = fix_size(job)?;
+    if size >= job.size && !job.whole_confirmed {
+        return Err("a format at the full size of the drive needs an explicit confirmation".into());
+    }
+    if job.fs == Fs::Fat32 && size > FAT32_MAX {
         return Err("FAT32 is limited to 32 GB here; choose exFAT".into());
     }
+    Ok((size, mac_fix_args(disk_id, job, size)))
+}
+
+fn run_fix(disk: &Disk, job: &Job) -> Result<String, String> {
+    let (size, args) = plan_fix(&disk.id, job)?;
     #[cfg(target_os = "macos")]
     {
+        let _ = size;
         let _ = diskutil(&["unmountDisk", "force", &disk.id]);
-        let args = mac_fix_args(&disk.id, job);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         diskutil(&args)
     }
     #[cfg(windows)]
     {
+        let _ = args;
         let script = std::env::temp_dir().join(format!("UsbMemoryChecker-fix-{}.txt", std::process::id()));
-        std::fs::write(&script, diskpart_script(&disk.id, job)).map_err(|e| e.to_string())?;
+        std::fs::write(&script, diskpart_script(&disk.id, job, size)).map_err(|e| e.to_string())?;
         let out = crate::net::command("diskpart.exe").arg("/s").arg(&script).output();
         let _ = std::fs::remove_file(&script);
         let out = out.map_err(|e| format!("could not run diskpart: {e}"))?;
@@ -239,7 +305,7 @@ fn run_fix(disk: &Disk, job: &Job) -> Result<String, String> {
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        let _ = (disk, job);
+        let _ = (disk, job, size, args);
         Err("not supported on this system".into())
     }
 }
@@ -432,7 +498,17 @@ mod tests {
     use super::*;
 
     fn job(real: u64, fs: Fs) -> Job {
-        Job { action: Action::Fix, disk: "disk4".into(), size: 2_000_398_934_016, real, fs, label: "my usb!".into() }
+        Job {
+            action: Action::Fix,
+            disk: "disk4".into(),
+            size: 2_000_398_934_016,
+            real,
+            partition: 0,
+            layout: None,
+            whole_confirmed: true,
+            fs,
+            label: "my usb!".into(),
+        }
     }
 
     #[test]
@@ -452,19 +528,25 @@ mod tests {
 
     #[test]
     fn mac_commands() {
-        let a = mac_fix_args("disk4", &job(8 << 30, Fs::Exfat));
+        let j = job(8 << 30, Fs::Exfat);
+        let a = mac_fix_args("disk4", &j, fix_size(&j).unwrap());
         assert_eq!(a, ["partitionDisk", "disk4", "2", "MBR", "ExFAT", "MYUSB", "8587837440", "FREE", "gap", "R"]);
-        let full = mac_fix_args("disk4", &job(0, Fs::Fat32));
+        let j = job(0, Fs::Fat32);
+        let full = mac_fix_args("disk4", &j, fix_size(&j).unwrap());
         assert_eq!(full, ["eraseDisk", "FAT32", "MYUSB", "MBR", "disk4"]);
     }
 
     #[test]
     fn diskpart_commands() {
-        let s = diskpart_script("3", &job(8 << 30, Fs::Exfat));
+        let j = job(8 << 30, Fs::Exfat);
+        let s = diskpart_script("3", &j, fix_size(&j).unwrap());
         assert!(s.starts_with("select disk 3\r\n"));
         assert!(s.contains("create partition primary size=8190\r\n"));
         assert!(s.contains("format fs=exfat quick label=\"MYUSB\""));
-        assert!(diskpart_script("3", &job(0, Fs::Fat32)).contains("create partition primary\r\nformat fs=fat32"));
+        let j = job(0, Fs::Fat32);
+        assert!(
+            diskpart_script("3", &j, fix_size(&j).unwrap()).contains("create partition primary\r\nformat fs=fat32")
+        );
     }
 
     #[test]
@@ -482,6 +564,80 @@ mod tests {
         let back: Job = serde_json::from_str(&serde_json::to_string(&j).unwrap()).unwrap();
         assert_eq!(back, j);
         let minimal: Job = serde_json::from_str(r#"{"action":"probe","disk":"disk2","size":10}"#).unwrap();
-        assert_eq!((minimal.fs, minimal.real), (Fs::Exfat, 0));
+        assert_eq!((minimal.fs, minimal.real, minimal.partition), (Fs::Exfat, 0, 0));
+    }
+
+    #[test]
+    fn fix_sizes() {
+        let size = 125_829_120_000;
+        let with = |real, partition| Job { size, partition, ..job(real, Fs::Exfat) };
+        assert_eq!(fix_size(&with(0, 0)), Ok(size));
+        assert_eq!(fix_size(&with(8 << 30, 0)), Ok((8 << 30) - (2 << 20)));
+        assert!(fix_size(&with(1 << 20, 0)).is_err());
+        assert!(fix_size(&with((2 << 20) + 5, 0)).is_err());
+        assert_eq!(fix_size(&with(0, 8_303_673_344)), Ok(8_303_673_344));
+        assert!(fix_size(&with(0, 8_303_673_345)).is_err());
+        assert!(fix_size(&with(0, size + (1 << 20))).is_err());
+        assert!(fix_size(&with(0, 1000)).is_err());
+        assert_eq!(fix_size(&with(0, size)), Ok(size));
+    }
+
+    #[test]
+    fn exact_partition_commands() {
+        let j = Job { size: 125_829_120_000, partition: 8_303_673_344, ..job(0, Fs::Exfat) };
+        let size = fix_size(&j).unwrap();
+        let a = mac_fix_args("disk6", &j, size);
+        assert_eq!(a[a.len() - 4..], ["8303673344", "FREE", "gap", "R"]);
+        assert!(diskpart_script("3", &j, size).contains("create partition primary size=7919\r\n"));
+    }
+
+    #[test]
+    fn run_fix_refuses_size_zero_before_touching_the_drive() {
+        let j = Job { size: 125_829_120_000, ..job(1 << 20, Fs::Exfat) };
+        assert!(plan_fix("disk6", &j).is_err());
+        let fat = Job { size: 125_829_120_000, partition: 40_000_000_000 / MIB * MIB, ..job(0, Fs::Fat32) };
+        assert!(plan_fix("disk6", &fat).is_err());
+    }
+
+    #[test]
+    fn a_swapped_drive_is_refused_before_anything_is_touched() {
+        let disk = |uuid: &str| Disk {
+            id: "disk6".into(),
+            device: String::new(),
+            name: String::new(),
+            kind: "usb".into(),
+            bus: "USB".into(),
+            size: 2_000_398_934_016,
+            block_size: 512,
+            volumes: Vec::new(),
+            partitions: vec![disks::Partition { offset: 1 << 20, size: 1 << 30, id: uuid.into() }],
+            table_unreadable: false,
+            table_id: String::new(),
+        };
+        let mut j = job(0, Fs::Exfat);
+        assert!(check_layout(&j, &disk("A")).is_ok(), "no layout: no check (command line)");
+        j.layout = Some(crate::capacity::Fingerprint::of(&disk("A")));
+        assert!(check_layout(&j, &disk("A")).is_ok());
+        assert!(check_layout(&j, &disk("B")).is_err());
+        // the job survives the file round trip with its layout
+        let back: Job = serde_json::from_str(&serde_json::to_string(&j).unwrap()).unwrap();
+        assert_eq!(back, j);
+    }
+
+    #[test]
+    fn a_full_size_format_needs_the_confirmation() {
+        let size = 125_829_120_000;
+        let whole = |confirmed| Job { size, whole_confirmed: confirmed, ..job(0, Fs::Exfat) };
+        assert!(plan_fix("disk6", &whole(false)).is_err(), "eraseDisk / diskpart without the flag is refused");
+        assert!(plan_fix("disk6", &whole(true)).is_ok());
+        // an exact partition equal to the declared size is a full-size format too
+        let exact = Job { partition: size, ..whole(false) };
+        assert!(plan_fix("disk6", &exact).is_err());
+        // a smaller partition needs no confirmation
+        let part = Job { partition: 8_303_673_344, ..whole(false) };
+        assert!(plan_fix("disk6", &part).is_ok());
+        // old job files (no flag) are refused for a whole-drive format
+        let old: Job = serde_json::from_str(r#"{"action":"fix","disk":"disk2","size":10}"#).unwrap();
+        assert!(!old.whole_confirmed);
     }
 }

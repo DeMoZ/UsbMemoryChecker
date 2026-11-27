@@ -67,7 +67,12 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
                     eprintln!("{} {} / {} MB", p.op, p.done >> 20, p.total >> 20);
                 }
             })
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| match e {
+                fullcheck::Error::Gone => {
+                    "the drive is gone: a test file is missing (unplugged or remounted)".to_string()
+                }
+                e => format!("{e:?}"),
+            })?;
             if r.stopped_early && !told_early {
                 eprintln!(
                     "writing stopped early after {} MB: samples could not be read, checked what was written",
@@ -78,14 +83,7 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
         }
         Some(action @ ("probe" | "fix")) => {
             let d = disk(args.get(1))?;
-            let job = helper::Job {
-                action: if action == "probe" { helper::Action::Probe } else { helper::Action::Fix },
-                disk: d.id.clone(),
-                size: d.size,
-                real: args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
-                fs: if args.get(3).is_some_and(|s| s == "fat32") { helper::Fs::Fat32 } else { helper::Fs::Exfat },
-                label: args.get(4).cloned().unwrap_or_else(|| "USB".into()),
-            };
+            let job = job(action, &d, args)?;
             let mut last = String::new();
             helper::run(&job, i18n::admin_prompt("en"), &cancel, &mut |f, stage| {
                 let line = format!("{stage} {:.0}%", f * 100.0);
@@ -103,5 +101,73 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             "usage: --cli list | speed <disk> <MB> | full <disk> [MB] | probe <disk> | fix <disk> <real> [fs] [label]"
                 .into(),
         ),
+    }
+}
+
+/// The job of `--cli probe|fix <disk> <real bytes|0> [exfat|fat32] [LABEL]`: no exact partition size and no layout
+/// check. A repair needs the size: a missing or non-numeric one is an error, and only an explicit `0` (or a size that
+/// is not below the drive's) is a request for the whole drive.
+fn job(action: &str, d: &disks::Disk, args: &[String]) -> Result<helper::Job, String> {
+    let fix = action != "probe";
+    // the size belongs to the repair only: a quick check never reads it
+    let real: u64 = match (fix, args.get(2)) {
+        (false, _) => 0,
+        (true, Some(s)) => s
+            .parse()
+            .map_err(|_| format!("the size must be a number of bytes (or 0 for the whole drive), not {s:?}"))?,
+        (true, None) => return Err("fix needs the size in bytes, or 0 for the whole drive".into()),
+    };
+    Ok(helper::Job {
+        action: if fix { helper::Action::Fix } else { helper::Action::Probe },
+        disk: d.id.clone(),
+        size: d.size,
+        real,
+        partition: 0,
+        layout: None,
+        // only an explicit whole-drive request confirms a format at the full size
+        whole_confirmed: fix && (real == 0 || real >= d.size),
+        fs: if args.get(3).is_some_and(|s| s == "fat32") { helper::Fs::Fat32 } else { helper::Fs::Exfat },
+        label: args.get(4).cloned().unwrap_or_else(|| "USB".into()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_fix_builds_a_job_without_a_plan_or_layout() {
+        let d = disks::Disk {
+            id: "disk4".into(),
+            device: String::new(),
+            name: String::new(),
+            kind: "usb".into(),
+            bus: "USB".into(),
+            size: 1000,
+            block_size: 512,
+            volumes: Vec::new(),
+            partitions: Vec::new(),
+            table_unreadable: false,
+            table_id: String::new(),
+        };
+        let args: Vec<String> = ["fix", "disk4", "0", "fat32", "MY"].map(String::from).to_vec();
+        let j = job("fix", &d, &args).unwrap();
+        assert_eq!((j.partition, j.layout.is_none(), j.real, j.whole_confirmed), (0, true, 0, true));
+        assert_eq!((j.fs, j.label.as_str(), j.action), (helper::Fs::Fat32, "MY", helper::Action::Fix));
+        let args: Vec<String> = ["fix", "disk4", "8589934592"].map(String::from).to_vec();
+        // 8 GiB on a 1000-byte "drive" is not below its size: the whole drive
+        assert!(job("fix", &d, &args).unwrap().whole_confirmed);
+        let big = disks::Disk { size: 125_829_120_000, ..d.clone() };
+        let j = job("fix", &big, &args).unwrap();
+        assert_eq!((j.real, j.whole_confirmed), (8_589_934_592, false));
+        assert_eq!(job("probe", &d, &args).unwrap().action, helper::Action::Probe);
+        // a forgotten or garbled size never erases the whole drive
+        let missing: Vec<String> = ["fix", "disk4"].map(String::from).to_vec();
+        assert!(job("fix", &big, &missing).is_err());
+        let text: Vec<String> = ["fix", "disk4", "8GB"].map(String::from).to_vec();
+        assert!(job("fix", &big, &text).is_err());
+        assert!(job("probe", &big, &missing).is_ok());
+        let zero: Vec<String> = ["fix", "disk4", "0"].map(String::from).to_vec();
+        assert!(job("fix", &big, &zero).unwrap().whole_confirmed);
     }
 }

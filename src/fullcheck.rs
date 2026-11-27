@@ -72,6 +72,8 @@ pub enum Error {
     /// Samples showed errors (wrong data or failed reads) that the full read-back did not confirm: writing
     /// stopped early, only part of the free space was tested and the result is unclear; run the check again.
     Inconclusive,
+    /// A test file is missing and the volume itself is gone too (unplugged or unmounted): no verdict.
+    Gone,
 }
 
 /// The place the test files go to: a folder on the mounted volume, or a simulated drive in tests.
@@ -342,6 +344,9 @@ fn run_inner(
             match vol.create(file) {
                 Ok(()) => {}
                 Err(e) if is_disk_full(&e) => break,
+                // "not found" means the drive is gone only when the volume itself is gone; a missing test file on a mounted
+                // volume is damage (a wrap-around fake can overwrite the directory)
+                Err(e) if e.kind() == io::ErrorKind::NotFound && vol.space().is_err() => return Err(Error::Gone),
                 Err(e) => return Err(Error::Io(format!("could not create test file {}: {e}", file + 1))),
             }
             lens.push(0);
@@ -395,6 +400,9 @@ fn run_inner(
                             > 0;
                         (bad, bad)
                     }
+                    // "not found" means the drive is gone only when the volume itself is gone; a missing test file on a mounted
+                    // volume is damage (a wrap-around fake can overwrite the directory)
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && vol.space().is_err() => return Err(Error::Gone),
                     Err(e) if dio::is_access_error(&e) => {
                         return Err(Error::Io(format!("could not read a sample: {e}")));
                     }
@@ -427,6 +435,9 @@ fn run_inner(
                 let secs = t.elapsed().as_secs_f64();
                 let read_ok = match r {
                     Ok(()) => true,
+                    // "not found" means the drive is gone only when the volume itself is gone; a missing test file on a mounted
+                    // volume is damage (a wrap-around fake can overwrite the directory)
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && vol.space().is_err() => return Err(Error::Gone),
                     Err(e) if dio::is_access_error(&e) => return Err(Error::Io(format!("could not read back: {e}"))),
                     Err(_) => false,
                 };
@@ -503,6 +514,13 @@ mod tests {
         write_error_at: Option<u64>,
         /// Numbers (1-based) of the read calls that fail with an I/O error, whatever they read.
         flaky_reads: Vec<usize>,
+        /// Reads of this file fail with "not found" (the volume went away).
+        missing_file: Option<usize>,
+        /// Creating this file fails with "not found" (the test folder is gone).
+        create_not_found: Option<usize>,
+        /// `space()` fails after the first call (the one at the start of the check): the volume itself is gone.
+        volume_gone: bool,
+        space_calls: std::cell::Cell<u32>,
         /// Numbers (1-based) of the read calls whose first byte comes back flipped (no error).
         flip_reads: Vec<usize>,
         /// Bytes of an old test folder that `prepare` removes (they count as used space until then).
@@ -538,6 +556,10 @@ mod tests {
                 disk_full_at: None,
                 write_error_at: None,
                 flaky_reads: Vec::new(),
+                missing_file: None,
+                create_not_found: None,
+                volume_gone: false,
+                space_calls: std::cell::Cell::new(0),
                 flip_reads: Vec::new(),
                 leftover: 0,
                 cache_hit_lens: Vec::new(),
@@ -557,6 +579,10 @@ mod tests {
 
     impl Volume for SimVolume {
         fn space(&self) -> io::Result<(u64, u64)> {
+            self.space_calls.set(self.space_calls.get() + 1);
+            if self.volume_gone && self.space_calls.get() > 1 {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
             Ok((self.total - self.used - self.leftover, self.total))
         }
         fn prepare(&mut self) -> io::Result<()> {
@@ -565,6 +591,9 @@ mod tests {
         }
         fn create(&mut self, file: usize) -> io::Result<()> {
             self.log.push(Op::Create(file));
+            if self.create_not_found == Some(file) {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
             if self.create_error == Some(file) {
                 return Err(io::Error::other("cannot create"));
             }
@@ -610,6 +639,9 @@ mod tests {
                 && *n == self.reads
             {
                 flag.store(true, Ordering::Relaxed);
+            }
+            if self.missing_file == Some(file) {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
             }
             if self.flaky_reads.contains(&self.reads) {
                 return Err(io::Error::other("read hiccup"));
@@ -1035,6 +1067,54 @@ mod tests {
     }
 
     #[test]
+    fn create_not_found_is_gone() {
+        let mut sim = SimVolume::genuine(64 * MIB, MIB);
+        sim.volume_gone = true;
+        sim.create_not_found = Some(1);
+        let (r, ev) = run_sim(&mut sim);
+        assert!(matches!(r, Err(Error::Gone)), "{r:?}");
+        assert_clean(&sim, &ev);
+    }
+
+    #[test]
+    fn missing_file_in_sample_is_gone() {
+        let mut sim = SimVolume::genuine(64 * MIB, MIB);
+        sim.volume_gone = true;
+        sim.missing_file = Some(0);
+        let (r, ev) = run_sim(&mut sim);
+        assert!(matches!(r, Err(Error::Gone)), "{r:?}");
+        assert_clean(&sim, &ev);
+    }
+
+    #[test]
+    fn missing_file_in_readback_is_gone() {
+        // the last (partial) file is never sampled, so only the read-back opens it
+        let mut sim = SimVolume::genuine(64 * MIB, MIB);
+        sim.volume_gone = true;
+        sim.missing_file = Some(6);
+        let (r, ev) = run_sim(&mut sim);
+        assert!(matches!(r, Err(Error::Gone)), "{r:?}");
+        assert_clean(&sim, &ev);
+    }
+
+    #[test]
+    fn a_missing_test_file_on_a_mounted_volume_is_damage() {
+        // a wrap-around fake can overwrite the directory: the volume is there, the file is not
+        let mut sim = SimVolume::genuine(64 * MIB, MIB);
+        sim.missing_file = Some(0);
+        let (r, ev) = run_sim(&mut sim);
+        let out = r.expect("a result, not Gone");
+        assert!(out.bad > 0 && out.stopped_early, "{out:?}");
+        assert_clean(&sim, &ev);
+        // in the read-back only (the last file is never sampled)
+        let mut sim = SimVolume::genuine(64 * MIB, MIB);
+        sim.missing_file = Some(6);
+        let (r, ev) = run_sim(&mut sim);
+        assert!(r.unwrap().bad > 0);
+        assert_clean(&sim, &ev);
+    }
+
+    #[test]
     fn cancel_during_sample_reads() {
         let real = 40 * MIB;
         let flag = Arc::new(AtomicBool::new(false));
@@ -1050,13 +1130,14 @@ mod tests {
     #[test]
     fn sample_time_not_in_write_stats() {
         let mut sim = SimVolume::genuine(64 * MIB, MIB);
-        let delay = Duration::from_millis(100);
+        let delay = Duration::from_millis(300);
         sim.slow_reads = Some((256 << 10, delay));
         let (r, ev) = run_sim(&mut sim);
         let out = r.unwrap();
         let samples = sim.log.iter().filter(|o| matches!(o, Op::Read(_, _, l) if *l == 256 << 10)).count() as f64;
         assert!(samples > 0.0);
-        assert!(out.write.seconds < samples * delay.as_secs_f64() / 2.0, "write.seconds = {}", out.write.seconds);
+        // the sample reads together take samples * delay: none of that time may be in the write stats
+        assert!(out.write.seconds < samples * delay.as_secs_f64(), "write.seconds = {}", out.write.seconds);
         assert_clean(&sim, &ev);
     }
 

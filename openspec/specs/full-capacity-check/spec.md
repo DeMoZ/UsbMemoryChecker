@@ -139,7 +139,9 @@ measured wrap period (the real size) lowered to the lowest damaged cell, as the 
 ### Requirement: Access errors abort the run
 A sample read or read-back read that fails because the system refused access (no rights, busy, write-protected,
 device gone) SHALL end the check with an I/O error instead of counting as damage, so a blocked volume never looks
-fake. Other read errors SHALL count as damage.
+fake. A test file that is missing when the check opens it SHALL end the check with the "drive gone" error (window
+text `errDriveGone`) only when the volume itself is gone too (its free space cannot be read); on a mounted volume a
+missing file counts as damage. Other read errors SHALL count as damage.
 
 #### Scenario: Volume becomes inaccessible during sampling
 - **WHEN** a sample read fails with an access error
@@ -152,6 +154,21 @@ fake. Other read errors SHALL count as damage.
 #### Scenario: Sample read fails with a media error
 - **WHEN** a sample read fails with any other I/O error
 - **THEN** the sample counts as damaged and writing stops early
+
+#### Scenario: Drive unplugged during the check
+- **WHEN** opening a test file for a sample read or for the read-back fails with "not found" and the volume's free
+  space cannot be read either
+- **THEN** the check ends with the "drive gone" error, no verdict is shown and the drive's record is unchanged
+
+#### Scenario: A test file is missing on a mounted volume
+- **WHEN** opening a test file fails with "not found" but the volume is still mounted (a wrap-around fake can
+  overwrite the directory)
+- **THEN** the missing data counts as damage, like any other failed read
+
+#### Scenario: Cut short by a write error after almost nothing was written
+- **WHEN** a write error ends the test after less than 1 MiB was written
+- **THEN** the check is reported as failed (I/O error with the system text), the record is unchanged, and the repair
+  plan is never the whole drive because of it
 
 ### Requirement: Progress and speed statistics
 Progress events SHALL report `write` while filling and `read` while reading back, with the done/total bytes of that
@@ -276,6 +293,11 @@ volume.
 - **WHEN** a task or an update download is running
 - **THEN** the button is disabled
 
+#### Scenario: Update download starts while the offer is shown
+- **WHEN** the offer's button is enabled and an update download starts (the window gets an update message with
+  `downloading` = true)
+- **THEN** the button becomes disabled at once, and enabled again when the download ends without restarting the app
+
 #### Scenario: Drive removed or changed
 - **WHEN** the repaired disk disappears from the list or its size changes
 - **THEN** the offer and the "repaired" message are dropped
@@ -300,10 +322,65 @@ reported to the window as an error.
   start
 
 ### Requirement: A drive that keeps nothing cannot be repaired
-When the full check's estimate leaves no usable size (the repair size is 0), the window SHALL show the drive as keeping
-no data and not offer a repair size.
+When a check's result leaves no usable size (the repair size `helper::partition_size(real, declared)` is 0), the
+window SHALL show the drive as keeping no data and not offer a repair size, and the application SHALL refuse a repair
+of it. A real size above 0 SHALL NOT by itself mean the drive is usable.
 
 #### Scenario: Estimate 0
 - **WHEN** a full check ends with bad data and a repair size of 0
 - **THEN** the verdict and the Repair tab say that the drive keeps no data and cannot be repaired, and the repair
   button stays disabled
+
+#### Scenario: Estimate is only the used space before the test
+- **WHEN** a full check on a volume where only the test folder's first cluster (32 KiB) was in use finds every test
+  block damaged, so the estimate is 32 KiB and the repair size is 0
+- **THEN** the drive shows as keeping no data, the verdict has no "Repair to …" button, and the window never shows
+  "Repair to 0 B"
+
+### Requirement: Full check of a partition smaller than the drive
+A full check SHALL count as a check of the whole device only when the volume misses at most max(64 MiB, 2%) of the
+declared size, the partitions end within 16 MiB (`TAIL_SLACK`) of its end, and at most that much was in use before the test. Any
+other volume, a volume within a known loss, and any volume of a drive our repair made smaller SHALL count as a check of
+that partition only. A passing result SHALL verify the partition, never the full declared size.
+
+#### Scenario: Passing check of a repaired fake
+- **WHEN** the full check of the 8.3 GB volume on a 125.8 GB drive finds no damaged block
+- **THEN** the result is "partition verified" with real = 8.3 GB. The Real capacity box does not show
+  "126 GB · Verified: all real", and the Repair tab keeps 8.3 GB as the default size
+
+#### Scenario: Passing check of a repaired fake that kept 95%
+- **WHEN** a drive with a recorded loss of 120 GB and a recorded repair has a 118 GB volume (the unused tail is
+  below the margin) and the full check passes
+- **THEN** the scope is partition, the loss stays, and the state is repaired and verified, not genuine
+
+#### Scenario: Volume was nearly full
+- **WHEN** more than max(64 MiB, 2%) of the drive was in use before a full check, and the check passes (the little free
+  space written wraps onto the cells of the old files on a fake drive)
+- **THEN** it is a partition check that is not "verified", a known loss is kept, and the drive is not shown as genuine
+
+#### Scenario: Passing check of a volume a bit smaller than the drive
+- **WHEN** there is no record, the drive declares 126 GB, the partition is 119 GB and its full check passes
+- **THEN** the result is "partition verified" for 119 GB, not "Verified: all real 126 GB", and the default repair
+  size is the verified size
+
+#### Scenario: Full check ended by a write error
+- **WHEN** the check writes part of the free space, the drive then answers writes with an I/O error, and what was
+  written reads back intact (also when less than the free space was written without an error)
+- **THEN** the result is a partition check with real = the bytes in use before plus the bytes written, never
+  genuine at the declared size, and a known loss is neither cleared nor raised; the window shows the write error
+
+#### Scenario: Cut-short check on a limited or repaired drive
+- **WHEN** a full check ended by a write error (or wrote clearly less than the free space) on a drive with a
+  limited layout or a repaired drive
+- **THEN** it never counts as "verified"; "partition verified" shows only what was written (the smaller of the limit
+  and the written size), the repair plan follows that size, and the verdict says the check was cut short
+
+#### Scenario: Passing check of a full-size volume
+- **WHEN** the volume covers the declared size (at most max(64 MiB, 2%) is missing, the partitions end within 16 MiB
+  (`TAIL_SLACK`) of its end) and at most that much was in use before the test, and the check passes
+- **THEN** the result is genuine for the whole drive, as before
+
+#### Scenario: Partition check finds loss
+- **WHEN** the full check of a partition finds damaged data with estimate E
+- **THEN** the recorded loss becomes the smaller of the known loss and `min(E, declared) / 100 × 99`, and the window
+  shows the "loses data" verdict

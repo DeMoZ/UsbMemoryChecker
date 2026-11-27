@@ -9,6 +9,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bench;
+mod capacity;
 mod cli;
 mod dio;
 mod disks;
@@ -78,13 +79,6 @@ struct Task {
     disk: String,
 }
 
-/// Result of the last capacity check of a drive: what the repair needs.
-#[derive(Clone)]
-struct Capacity {
-    reported: u64,
-    real: u64,
-}
-
 struct State {
     settings: Settings,
     lang: &'static str,
@@ -95,10 +89,17 @@ struct State {
     /// The first scan of drives is done (until then the window says "looking for drives").
     scanned: bool,
     task: Option<Task>,
+    /// Counts task starts and ends: a drive scan that overlapped one is stale and not applied.
+    task_gen: u64,
     cancel: Arc<AtomicBool>,
-    capacity: HashMap<String, Capacity>,
-    /// Ask the disk watcher to look now.
-    rescan: Sender<()>,
+    /// What is known about each connected drive, by `diskN`.
+    capacity: HashMap<String, capacity::Entry>,
+    /// `capacity.json`: the knowledge of drives that are not connected now.
+    store: capacity::Store,
+    /// When this run of the program started (a check made before is "remembered").
+    started: u64,
+    /// Ask the disk watcher to look now; the number is the window's Reload request (0 = no request).
+    rescan: Sender<u64>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -126,6 +127,25 @@ struct Request {
     value: Option<bool>,
     #[serde(default)]
     lang: Option<String>,
+    /// `rescan`: the number of the Reload request the answer has to carry.
+    #[serde(default)]
+    seq: Option<u64>,
+    /// `fix`: which plan the window showed (`limit` or `whole`) and the partition size it showed.
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    /// `fix`: the user ticked "use the full declared size".
+    #[serde(default)]
+    whole: Option<bool>,
+    /// `fix` with `whole`: the state and limit of the drive the window showed when the box was ticked.
+    #[serde(default)]
+    shown_state: Option<String>,
+    #[serde(default)]
+    shown_limit: Option<u64>,
+    /// `fix`: the key of the drive's layout the window showed.
+    #[serde(default)]
+    layout: Option<String>,
 }
 
 fn page() -> String {
@@ -146,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let ui = Ui(event_loop.create_proxy());
     let settings = Settings::load();
-    let (rescan_tx, rescan_rx) = channel::<()>();
+    let (rescan_tx, rescan_rx) = channel::<u64>();
     let state: Shared = Arc::new(Mutex::new(State {
         lang: i18n::resolve(&settings.language),
         settings,
@@ -156,8 +176,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         disks: Vec::new(),
         scanned: false,
         task: None,
+        task_gen: 0,
         cancel: Arc::new(AtomicBool::new(false)),
         capacity: HashMap::new(),
+        store: capacity::Store::open(capacity::Store::default_path()),
+        started: settings::now(),
         rescan: rescan_tx,
     }));
     {
@@ -246,21 +269,21 @@ fn handle_request(req: Request, state: &Shared, ui: &Ui, proxy: &EventLoopProxy<
         "ready" => {
             let st = lock(state);
             ui.send(init_msg(&st));
-            ui.send(json!({"type": "disks", "disks": st.disks, "scanned": st.scanned}));
+            send_disks(&st, ui, json!({}));
             if let Some(t) = &st.task {
                 ui.send(json!({"type": "task", "kind": t.kind, "disk": t.disk, "fraction": 0.0, "stage": "prStart"}));
             }
             let auto = st.settings.auto_update
                 && update::install_target().is_some()
                 && settings::now().saturating_sub(st.settings.last_update_check) >= 86_400;
-            let _ = st.rescan.send(());
+            let _ = st.rescan.send(0);
             drop(st);
             if auto {
                 check_updates(state, ui, false);
             }
         }
         "rescan" => {
-            let _ = lock(state).rescan.send(());
+            let _ = lock(state).rescan.send(req.seq.unwrap_or(0));
         }
         "drag" => {
             let _ = proxy.send_event(UserEvent::DragWindow);
@@ -291,7 +314,13 @@ fn handle_request(req: Request, state: &Shared, ui: &Ui, proxy: &EventLoopProxy<
         "verifyRepaired" => start_task(state, ui, "full", req.disk, run_full),
         "fix" => {
             let (fs, label) = (req.fs.unwrap_or(helper::Fs::Exfat), req.label.unwrap_or_default());
-            start_task(state, ui, "fix", req.disk, move |ctx| run_fix(ctx, fs, label));
+            let (plan, size) = (req.plan.unwrap_or_default(), req.size.unwrap_or(0));
+            let layout = req.layout;
+            let shown = req.whole.unwrap_or(false).then(|| (req.shown_state.unwrap_or_default(), req.shown_limit));
+            start_task(state, ui, "fix", req.disk, move |ctx| {
+                let explicit = shown.as_ref().map(|(state, limit)| capacity::Shown { state, limit: *limit });
+                run_fix(ctx, fs, label, &plan, size, explicit, layout.as_deref())
+            });
         }
         "cancel" => lock(state).cancel.store(true, Ordering::Relaxed),
         "quit" => {
@@ -351,27 +380,108 @@ fn handle_request(req: Request, state: &Shared, ui: &Ui, proxy: &EventLoopProxy<
 
 // ---------------------------------------------------------------- drives
 
-fn disk_watcher(rx: Receiver<()>, state: Shared, ui: Ui) {
+/// The `disks` message: the drive list with the capacity view of every drive (the window only displays it).
+/// `extra` fields (`rescanned`, `stale`, `error`) are merged in.
+fn send_disks(st: &State, ui: &Ui, extra: Value) {
+    let views: serde_json::Map<String, Value> = st
+        .disks
+        .iter()
+        .map(|d| {
+            let busy = st.task.as_ref().is_some_and(|t| t.disk == d.id);
+            let view = capacity::view_entry(st.capacity.get(&d.id), d, st.started, busy);
+            (d.id.clone(), serde_json::to_value(view).unwrap_or(Value::Null))
+        })
+        .collect();
+    let mut msg = json!({"type": "disks", "disks": st.disks, "scanned": st.scanned, "capacity": views});
+    if let (Some(m), Some(e)) = (msg.as_object_mut(), extra.as_object()) {
+        m.extend(e.clone());
+    }
+    ui.send(msg);
+}
+
+/// What a finished scan sends to the window. Every Reload request (`asked` > 0) gets an answer, also when nothing
+/// changed; a failed scan answers it with the previous list marked `stale`. None: nothing to send.
+fn scan_reply(asked: u64, scan: Result<bool, &str>) -> Option<Value> {
+    match scan {
+        Ok(changed) => (changed || asked > 0).then(|| json!({"rescanned": asked})),
+        Err(e) => (asked > 0).then(|| json!({"rescanned": asked, "stale": true, "error": e})),
+    }
+}
+
+enum Applied {
+    /// The scan overlapped a task start or end.
+    Stale,
+    /// The scan is applied; the `disks` message to send (if any) and the save of the store to run outside the lock.
+    Done(Option<Value>, Option<capacity::SaveJob>),
+}
+
+/// Applies a finished drive scan (`generation`: the task counter when it started).
+fn apply_scan(st: &mut State, generation: u64, list: Vec<disks::Disk>, asked: u64, now: u64) -> Applied {
+    if st.task_gen != generation {
+        return Applied::Stale;
+    }
+    let changed = st.disks != list || !st.scanned;
+    st.scanned = true;
+    // Knowledge of a drive that is gone or changed size is no longer shown (the saved records stay). During a task
+    // every drive except the task's own is still kept in step, because the task's drive layout belongs to the task
+    // (a repair re-keys its own record).
+    let task_disk = st.task.as_ref().map(|t| t.disk.clone());
+    let synced = capacity::sync(&mut st.capacity, &mut st.store, &list, now, task_disk.as_deref());
+    st.disks = list;
+    let job = if synced { st.store.save_job() } else { None };
+    Applied::Done(scan_reply(asked, Ok(changed || synced)), job)
+}
+
+fn disk_watcher(rx: Receiver<u64>, state: Shared, ui: Ui) {
     let every = Duration::from_secs(if cfg!(windows) { 4 } else { 2 });
+    // the newest Reload request that has not been answered yet
+    let mut asked = 0u64;
     loop {
+        // requests that came in before this pass started are answered by it
+        while let Ok(n) = rx.try_recv() {
+            asked = asked.max(n);
+        }
+        let generation = lock(&state).task_gen;
         match disks::list() {
             Ok(list) => {
-                let mut st = lock(&state);
-                if st.disks != list || !st.scanned {
-                    st.scanned = true;
-                    // results of a drive that is gone or changed size are no longer valid
-                    st.capacity.retain(|id, c| list.iter().any(|d| &d.id == id && d.size == c.reported));
-                    st.disks = list;
-                    ui.send(json!({"type": "disks", "disks": st.disks, "scanned": true}));
+                let mut guard = lock(&state);
+                match apply_scan(&mut guard, generation, list, asked, settings::now()) {
+                    // a task started or ended while the scan ran: it saw the drive before or half-way through the
+                    // task and is not applied; the next scan answers the Reload request (at once)
+                    Applied::Stale => {
+                        drop(guard);
+                        if asked > 0 {
+                            continue;
+                        }
+                    }
+                    Applied::Done(extra, job) => {
+                        if let Some(extra) = extra {
+                            send_disks(&guard, &ui, extra);
+                        }
+                        drop(guard);
+                        // the file is written outside the lock (it is flushed to disk)
+                        if let Some(job) = job {
+                            job.run();
+                        }
+                        asked = 0;
+                    }
                 }
             }
-            Err(e) => eprintln!("drive list: {e}"),
+            Err(e) => {
+                eprintln!("drive list: {e}");
+                if let Some(extra) = scan_reply(asked, Err(&e)) {
+                    let mut st = lock(&state);
+                    st.scanned = true;
+                    send_disks(&st, &ui, extra);
+                }
+                asked = 0;
+            }
         }
         match rx.recv_timeout(every) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(n) => asked = asked.max(n),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        while rx.try_recv().is_ok() {}
     }
 }
 
@@ -432,6 +542,7 @@ where
         return;
     };
     st.task = Some(Task { kind, disk: disk.id.clone() });
+    st.task_gen += 1;
     st.cancel = Arc::new(AtomicBool::new(false));
     let cancel = Arc::clone(&st.cancel);
     drop(st);
@@ -453,6 +564,7 @@ where
         let cancelled = ctx.cancel.load(Ordering::Relaxed);
         let mut st = lock(&state);
         st.task = None;
+        st.task_gen += 1;
         let msg = match result {
             Ok(v) => json!({"type": "taskDone", "kind": kind, "disk": id, "ok": true, "result": v}),
             Err(_) if cancelled => {
@@ -463,7 +575,9 @@ where
             }
         };
         ui.send(msg);
-        let _ = st.rescan.send(());
+        // the state the window shows comes from the knowledge, so it gets the new one right away
+        send_disks(&st, &ui, json!({}));
+        let _ = st.rescan.send(0);
     });
 }
 
@@ -512,20 +626,76 @@ fn run_full(ctx: &mut TaskCtx) -> TaskResult {
         };
         ctx.progress(fraction, stage, json!({"done": p.done, "total": p.total, "mbps": p.mbps}));
     });
+    finish_full(&ctx.state, &ctx.disk, r)
+}
+
+/// The outcome of the full check: the record is worked out from everything known about the drive (also what only
+/// the store holds) and saved; a failed, cancelled or inconclusive check changes nothing.
+fn finish_full(state: &Shared, disk: &disks::Disk, r: Result<fullcheck::Outcome, fullcheck::Error>) -> TaskResult {
     match r {
         Ok(o) => {
-            let disk = &ctx.disk;
-            // a bad block means the drive loses data: the estimate becomes the size for the repair
-            if o.bad > 0 {
-                let real = o.real_estimate.min(disk.size) / 100 * 99;
-                lock(&ctx.state).capacity.insert(disk.id.clone(), Capacity { reported: disk.size, real });
+            let declared = disk.size;
+            let result = capacity::FullResult {
+                total: o.total,
+                used_before: o.used_before,
+                tested: o.tested,
+                bad: o.bad,
+                real_estimate: o.real_estimate,
+                stopped_early: o.stopped_early,
+                write_error: o.write_error.clone(),
+                seconds: o.write.seconds + o.read.seconds,
+            };
+            if capacity::wrote_too_little(&result) {
+                let err = o.write_error.clone().unwrap_or_else(|| "the drive accepted almost no data".into());
+                return Err(("errIo", json!({"err": err})));
             }
-            Ok(json!({"full": o, "reported": disk.size}))
+            let disk = latest(state, disk);
+            let mut made = None;
+            record(state, &disk, None, |k| {
+                let rec = capacity::full_record(Some(k), &disk, &result, settings::now());
+                k.apply_full(rec.clone());
+                made = Some(rec);
+            });
+            Ok(json!({"full": o, "reported": declared, "check": made}))
         }
         Err(fullcheck::Error::Cancelled) => Err(("errCancelled", json!({}))),
         Err(fullcheck::Error::NoSpace(free)) => Err(("errNoSpaceFull", json!({"free": free}))),
         Err(fullcheck::Error::Io(e)) => Err(("errIo", json!({"err": e}))),
         Err(fullcheck::Error::Inconclusive) => Err(("errFullInconclusive", json!({}))),
+        Err(fullcheck::Error::Gone) => Err(("errDriveGone", json!({}))),
+    }
+}
+
+/// The drive as the last scan saw it (a check may have remounted its volume), else the one the task started with.
+/// A layout that cannot be read at that moment (a listing that lost the partition table once) does not replace a
+/// readable one the task started with: the result belongs to the drive that was checked.
+fn latest(state: &Shared, disk: &disks::Disk) -> disks::Disk {
+    let st = lock(state);
+    let now = st.disks.iter().find(|d| d.id == disk.id && d.size == disk.size);
+    match now {
+        Some(d) if capacity::Fingerprint::of(d).usable() || !capacity::Fingerprint::of(disk).usable() => d.clone(),
+        _ => disk.clone(),
+    }
+}
+
+/// Changes the knowledge of a drive and saves it (see `capacity::record_change`). `repair`: our own repair, with
+/// the layout the drive had before it.
+fn record(
+    state: &Shared,
+    disk: &disks::Disk,
+    repair: Option<&capacity::Fingerprint>,
+    change: impl FnOnce(&mut capacity::Knowledge),
+) {
+    let mut guard = lock(state);
+    let st = &mut *guard;
+    let job = if capacity::record_change(&mut st.capacity, &mut st.store, disk, settings::now(), repair, change) {
+        st.store.save_job()
+    } else {
+        None
+    };
+    drop(guard);
+    if let Some(job) = job {
+        job.run();
     }
 }
 
@@ -545,33 +715,119 @@ fn run_probe(ctx: &mut TaskCtx) -> TaskResult {
         disk: ctx.disk.id.clone(),
         size: ctx.disk.size,
         real: 0,
+        partition: 0,
+        layout: Some(capacity::Fingerprint::of(&latest(&ctx.state, &ctx.disk))),
+        whole_confirmed: false,
         fs: helper::Fs::Exfat,
         label: String::new(),
     };
-    let v = elevated(ctx, &job)?;
-    let outcome: probe::Outcome = serde_json::from_value(v)
-        .map_err(|e| ("errHelper", json!({"err": format!("unreadable probe result: {e}")})))?;
-    let mut st = lock(&ctx.state);
-    if outcome.verdict == probe::Verdict::Genuine {
-        st.capacity.remove(&ctx.disk.id);
-    } else {
-        st.capacity.insert(ctx.disk.id.clone(), Capacity { reported: ctx.disk.size, real: outcome.real });
-    }
-    Ok(json!({"probe": outcome}))
+    let v = elevated(ctx, &job);
+    finish_probe(&ctx.state, &ctx.disk, v)
 }
 
-fn run_fix(ctx: &mut TaskCtx, fs: helper::Fs, label: String) -> TaskResult {
-    let cap = lock(&ctx.state).capacity.get(&ctx.disk.id).cloned().filter(|c| c.reported == ctx.disk.size);
-    // without a check result the drive is formatted at full size
-    let real = cap.as_ref().map(|c| c.real).unwrap_or(0);
-    let job =
-        helper::Job { action: helper::Action::Fix, disk: ctx.disk.id.clone(), size: ctx.disk.size, real, fs, label };
-    if real == 0 && cap.is_some() {
-        return Err(("errBroken", json!({})));
+/// The outcome of the quick check: a declined or failed one changes nothing.
+fn finish_probe(state: &Shared, disk: &disks::Disk, v: TaskResult) -> TaskResult {
+    let v = v?;
+    let outcome: probe::Outcome = serde_json::from_value(v)
+        .map_err(|e| ("errHelper", json!({"err": format!("unreadable probe result: {e}")})))?;
+    let declared = disk.size;
+    let verdict = match outcome.verdict {
+        probe::Verdict::Genuine => capacity::Verdict::Genuine,
+        probe::Verdict::Fake => capacity::Verdict::Fake,
+        probe::Verdict::Damaged => capacity::Verdict::Damaged,
+        probe::Verdict::Broken => capacity::Verdict::Broken,
+    };
+    let rec = capacity::CheckRecord {
+        mode: capacity::Mode::Quick,
+        scope: capacity::Scope::Device,
+        verdict,
+        real: if verdict == capacity::Verdict::Genuine { declared } else { outcome.real },
+        declared,
+        points: outcome.points,
+        seconds: outcome.seconds,
+        restore_failures: outcome.restore_failures,
+        at: settings::now(),
+        ..Default::default()
+    };
+    record(state, &latest(state, disk), None, |k| k.apply_quick(rec.clone()));
+    Ok(json!({"probe": outcome, "check": rec}))
+}
+
+/// What the repair of `disk` needs before the helper starts: the exact partition size for the job (0 = the whole
+/// drive) and the entry to restore if the drive drops out of the list meanwhile. The plan is worked out again from
+/// everything known (the entry, else the store) and the current layout; a request that does not match is refused
+/// here, so no password window appears and the drive stays as it was.
+fn plan_repair(
+    state: &Shared,
+    disk: &disks::Disk,
+    plan: &str,
+    size: u64,
+    explicit: Option<capacity::Shown>,
+    layout: Option<&str>,
+) -> Result<(u64, Option<capacity::Entry>, disks::Disk), (&'static str, Value)> {
+    let mut guard = lock(state);
+    let st = &mut *guard;
+    let disk = st.disks.iter().find(|d| d.id == disk.id && d.size == disk.size).unwrap_or(disk).clone();
+    // the layout the window showed must be the one the drive has now (the helper checks the job's layout, which is
+    // Rust's own view, so the window's view is compared here)
+    if layout != Some(capacity::Fingerprint::of(&disk).key().as_str()) {
+        return Err(("errRepairChanged", json!({})));
     }
+    let before = capacity::entry_for(&st.capacity, &mut st.store, &disk, settings::now());
+    // knowledge that the drive's layout does not confirm gives no plan
+    let view = capacity::view_entry(before.as_ref(), &disk, st.started, false);
+    let partition = capacity::check_fix(&view, plan, size, explicit).map_err(|key| (key, json!({})))?;
+    Ok((partition, before, disk))
+}
+
+/// The repair: the window says which plan it showed (`limit` or `whole`), which size, and whether the full size
+/// was chosen explicitly.
+fn run_fix(
+    ctx: &mut TaskCtx,
+    fs: helper::Fs,
+    label: String,
+    plan: &str,
+    size: u64,
+    explicit: Option<capacity::Shown>,
+    layout: Option<&str>,
+) -> TaskResult {
+    let (partition, before, disk) = plan_repair(&ctx.state, &ctx.disk, plan, size, explicit, layout)?;
+    let declared = ctx.disk.size;
+    let job = helper::Job {
+        action: helper::Action::Fix,
+        disk: ctx.disk.id.clone(),
+        size: declared,
+        real: 0,
+        partition,
+        layout: Some(capacity::Fingerprint::of(&disk)),
+        // `check_fix` let the whole-drive plan through: it is the default of a genuine drive or the explicit choice
+        whole_confirmed: partition == 0,
+        fs,
+        label,
+    };
     elevated(ctx, &job)?;
-    lock(&ctx.state).capacity.remove(&ctx.disk.id);
-    Ok(json!({"size": helper::partition_size(real, ctx.disk.size)}))
+    let repair = if partition > 0 { capacity::Repair::Partition(partition) } else { capacity::Repair::Whole };
+    // the new layout: the list sent at the end of the task shows it, and the knowledge moves to it right away
+    // when the listing fails, the drive is taken as one without a usable layout: nothing is stored under any key
+    // (never the pre-repair layout, which a factory image shares with the drives of its batch) and the knowledge
+    // stays in memory, unconfirmed
+    let layout = disks::find(&ctx.disk.id, declared)
+        .unwrap_or_else(|_| disks::Disk { partitions: Vec::new(), ..latest(&ctx.state, &ctx.disk) });
+    let pre = capacity::Fingerprint::of(&disk);
+    let mut guard = lock(&ctx.state);
+    let st = &mut *guard;
+    let now = settings::now();
+    let job =
+        if capacity::finish_repair(&mut st.capacity, &mut st.store, &mut st.disks, before, layout, &pre, repair, now) {
+            st.store.save_job()
+        } else {
+            None
+        };
+    drop(guard);
+    if let Some(job) = job {
+        job.run();
+    }
+    Ok(json!({"size": if partition > 0 { partition } else { declared }}))
 }
 
 // ---------------------------------------------------------------- donations
@@ -696,4 +952,293 @@ fn install_update(state: &Shared, ui: &Ui, proxy: &EventLoopProxy<UserEvent>) {
             Err(e) => ui.send(update_msg(&st, Some(("err", "updFailed", json!({"err": e}))))),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_is_always_answered() {
+        // nothing changed: no message without a request, an answer with one
+        assert_eq!(scan_reply(0, Ok(false)), None);
+        assert_eq!(scan_reply(3, Ok(false)), Some(json!({"rescanned": 3})));
+        // the list changed by itself
+        assert_eq!(scan_reply(0, Ok(true)), Some(json!({"rescanned": 0})));
+        // a failed scan: silent without a request, a stale answer with one
+        assert_eq!(scan_reply(0, Err("boom")), None);
+        assert_eq!(scan_reply(2, Err("boom")), Some(json!({"rescanned": 2, "stale": true, "error": "boom"})));
+    }
+
+    const DECLARED: u64 = 125_829_120_000;
+    const MIB: u64 = 1 << 20;
+
+    fn test_disk(partition: u64) -> disks::Disk {
+        disks::Disk {
+            id: "disk6".into(),
+            device: "/dev/rdisk6".into(),
+            name: "Storage Device".into(),
+            kind: "usb".into(),
+            bus: "USB".into(),
+            size: DECLARED,
+            block_size: 512,
+            volumes: Vec::new(),
+            partitions: vec![disks::Partition { offset: MIB, size: partition, id: "UUID".into() }],
+            table_unreadable: false,
+            table_id: String::new(),
+        }
+    }
+
+    fn key(disk: &disks::Disk) -> Option<&'static str> {
+        Some(Box::leak(capacity::Fingerprint::of(disk).key().into_boxed_str()))
+    }
+
+    fn test_state(disk: &disks::Disk, knowledge: Option<capacity::Knowledge>) -> Shared {
+        let (tx, _rx) = channel::<u64>();
+        let mut capacity = HashMap::new();
+        if let Some(knowledge) = knowledge {
+            capacity
+                .insert(disk.id.clone(), capacity::Entry::new(knowledge, Some(capacity::Fingerprint::of(disk)), false));
+        }
+        Arc::new(Mutex::new(State {
+            settings: Settings::default(),
+            lang: "en",
+            donations: Vec::new(),
+            donations_loading: false,
+            updates: UpdateState::default(),
+            disks: vec![disk.clone()],
+            scanned: true,
+            task: None,
+            task_gen: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            capacity,
+            store: capacity::Store::default(),
+            started: 0,
+            rescan: tx,
+        }))
+    }
+
+    fn loss(real: u64) -> capacity::Knowledge {
+        let mut k = capacity::Knowledge::new(DECLARED);
+        k.apply_quick(capacity::CheckRecord {
+            mode: capacity::Mode::Quick,
+            verdict: capacity::Verdict::Fake,
+            real,
+            declared: DECLARED,
+            at: 1,
+            ..Default::default()
+        });
+        k
+    }
+
+    fn outcome(bad: u64, write_error: Option<&str>, tested: u64) -> fullcheck::Outcome {
+        fullcheck::Outcome {
+            tested,
+            ok: tested - bad,
+            bad,
+            first_bad: None,
+            total: DECLARED - 40 * MIB,
+            used_before: 8 * MIB,
+            real_estimate: tested,
+            write: Default::default(),
+            read: Default::default(),
+            write_error: write_error.map(str::to_string),
+            stopped_early: false,
+        }
+    }
+
+    #[test]
+    fn failed_cancelled_or_gone_checks_leave_the_record_unchanged() {
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, Some(loss(8_303_673_344)));
+        let before = lock(&state).capacity["disk6"].knowledge.clone();
+        let cases: [(fullcheck::Error, &str); 5] = [
+            (fullcheck::Error::Cancelled, "errCancelled"),
+            (fullcheck::Error::NoSpace(1), "errNoSpaceFull"),
+            (fullcheck::Error::Io("boom".into()), "errIo"),
+            (fullcheck::Error::Inconclusive, "errFullInconclusive"),
+            (fullcheck::Error::Gone, "errDriveGone"),
+        ];
+        for (error, key) in cases {
+            let r = finish_full(&state, &disk, Err(error));
+            assert_eq!(r.unwrap_err().0, key);
+            assert_eq!(lock(&state).capacity["disk6"].knowledge, before);
+        }
+    }
+
+    #[test]
+    fn a_full_check_that_ended_by_a_write_error_keeps_the_known_loss() {
+        let disk = disks::Disk {
+            partitions: vec![disks::Partition { offset: MIB, size: DECLARED - 2 * MIB, id: "U".into() }],
+            ..test_disk(0)
+        };
+        let state = test_state(&disk, Some(loss(8_303_673_344)));
+        let r = finish_full(&state, &disk, Ok(outcome(0, Some("Input/output error"), 8_000_000_000))).unwrap();
+        assert_eq!(r["check"]["scope"], "partition");
+        let st = lock(&state);
+        let k = &st.capacity["disk6"].knowledge;
+        assert_eq!(k.loss.as_ref().map(|l| l.real), Some(8_303_673_344));
+        assert!(k.last.as_ref().unwrap().write_error.is_some());
+    }
+
+    #[test]
+    fn a_repair_request_that_does_not_match_never_reaches_the_helper() {
+        let size = capacity::loss_repair_size(120_000_000_000, DECLARED);
+        let disk = test_disk(size);
+        let mut known = loss(120_000_000_000);
+        known.apply_repair(capacity::Repair::Partition(size), 5);
+        let state = test_state(&disk, Some(known));
+        // the stale window: full size without the explicit choice, or a size that is not the plan
+        assert_eq!(plan_repair(&state, &disk, "whole", DECLARED, None, key(&disk)).unwrap_err().0, "errRepairChanged");
+        assert_eq!(
+            plan_repair(&state, &disk, "limit", size + MIB, None, key(&disk)).unwrap_err().0,
+            "errRepairChanged"
+        );
+        assert_eq!(plan_repair(&state, &disk, "nonsense", size, None, key(&disk)).unwrap_err().0, "errRepairChanged");
+        // the plan itself, and the explicit full size
+        assert_eq!(plan_repair(&state, &disk, "limit", size, None, key(&disk)).unwrap().0, size);
+        let shown = capacity::Shown { state: "repaired", limit: Some(size) };
+        assert_eq!(plan_repair(&state, &disk, "whole", DECLARED, Some(shown), key(&disk)).unwrap().0, 0);
+        // the tick was made in another state than the one the drive has now
+        let other = capacity::Shown { state: "unknown", limit: None };
+        assert_eq!(
+            plan_repair(&state, &disk, "whole", DECLARED, Some(other), key(&disk)).unwrap_err().0,
+            "errRepairChanged"
+        );
+    }
+
+    #[test]
+    fn a_drive_that_keeps_nothing_is_refused_for_every_plan() {
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, Some(loss(MIB)));
+        let shown = capacity::Shown { state: "broken", limit: None };
+        for (plan, size) in [("limit", 8_000_000_000), ("whole", DECLARED), ("limit", 0)] {
+            assert_eq!(plan_repair(&state, &disk, plan, size, Some(shown), key(&disk)).unwrap_err().0, "errBroken");
+        }
+    }
+
+    #[test]
+    fn a_scan_that_overlapped_a_task_is_not_applied() {
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, None);
+        let mut st = lock(&state);
+        let other = disks::Disk { id: "disk9".into(), ..test_disk(1_000_000_000) };
+        // the scan started at generation 0, a task started and ended meanwhile
+        st.task_gen = 2;
+        assert!(matches!(apply_scan(&mut st, 0, vec![other.clone()], 7, 100), Applied::Stale));
+        assert_eq!(st.disks, vec![disk.clone()], "the stale list is not taken");
+        // the next scan is applied and answers the Reload request even when nothing changed
+        match apply_scan(&mut st, 2, vec![disk.clone()], 7, 101) {
+            Applied::Done(Some(extra), _) => assert_eq!(extra, json!({"rescanned": 7})),
+            _ => panic!("the Reload request must be answered"),
+        }
+        assert!(matches!(apply_scan(&mut st, 2, vec![disk], 0, 102), Applied::Done(None, _)));
+    }
+
+    #[test]
+    fn a_scan_that_changed_only_the_knowledge_is_sent() {
+        // a repaired drive plugged in during a task: listed without knowledge; after the task the store is read
+        let size = capacity::loss_repair_size(120_000_000_000, DECLARED);
+        let disk = test_disk(size);
+        let state = test_state(&disk, None);
+        let mut st = lock(&state);
+        let mut known = loss(120_000_000_000);
+        known.apply_repair(capacity::Repair::Partition(size), 5);
+        st.store.put(None, capacity::Fingerprint::of(&disk), known, 1);
+        // the list is the same, but sync loads the record: a message goes out although the list did not change
+        match apply_scan(&mut st, 0, vec![disk.clone()], 0, 100) {
+            Applied::Done(Some(_), _) => {}
+            _ => panic!("a changed state must be sent"),
+        }
+        let v = capacity::view_entry(st.capacity.get("disk6"), &disk, 0, false);
+        assert_eq!(v.state.as_str(), "repaired");
+        assert!(matches!(apply_scan(&mut st, 0, vec![disk], 0, 101), Applied::Done(None, _)));
+    }
+
+    fn probe_json(verdict: &str, real: u64) -> Value {
+        json!({"verdict": verdict, "reported": DECLARED, "real": real, "points": 10, "badPoints": 2, "seconds": 1.0, "restoreFailures": 0})
+    }
+
+    #[test]
+    fn a_declined_or_failed_quick_check_leaves_the_record_unchanged() {
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, Some(loss(8_303_673_344)));
+        let before = lock(&state).capacity["disk6"].knowledge.clone();
+        for key in ["errDeclined", "errHelper", "errCancelled"] {
+            let r = finish_probe(&state, &disk, Err((key, json!({}))));
+            assert_eq!(r.unwrap_err().0, key);
+            assert_eq!(lock(&state).capacity["disk6"].knowledge, before);
+        }
+        // an unreadable result changes nothing either
+        assert_eq!(finish_probe(&state, &disk, Ok(json!({"x": 1}))).unwrap_err().0, "errHelper");
+        assert_eq!(lock(&state).capacity["disk6"].knowledge, before);
+        // a good result does
+        finish_probe(&state, &disk, Ok(probe_json("fake", 5_000_000_000))).unwrap();
+        assert_eq!(lock(&state).capacity["disk6"].knowledge.loss.as_ref().unwrap().real, 5_000_000_000);
+    }
+
+    #[test]
+    fn a_transient_unreadable_layout_at_the_end_of_a_check_keeps_the_result() {
+        // the check started on a drive with a readable layout; the last scan lost the partition table once
+        let start = test_disk(8_000_000_000);
+        let glitch = disks::Disk { partitions: Vec::new(), ..start.clone() };
+        let state = test_state(&glitch, None);
+        assert_eq!(latest(&state, &start), start, "the layout the task started with is kept");
+        // a readable layout that changed (a remount) is taken as it is
+        let remounted = disks::Disk {
+            partitions: vec![disks::Partition { offset: MIB, size: 1, id: "N".into() }],
+            ..start.clone()
+        };
+        let state = test_state(&remounted, None);
+        assert_eq!(latest(&state, &start), remounted);
+        // the result of a quick check is recorded under the readable layout, so the next scan confirms it
+        let state = test_state(&glitch, None);
+        finish_probe(&state, &start, Ok(probe_json("fake", 5_000_000_000))).unwrap();
+        let st = lock(&state);
+        let v = capacity::view_entry(st.capacity.get("disk6"), &start, 0, false);
+        assert_eq!(v.state.as_str(), "fake");
+    }
+
+    #[test]
+    fn a_repair_request_for_another_layout_than_the_window_showed_is_refused() {
+        let size = capacity::loss_repair_size(120_000_000_000, DECLARED);
+        let disk = test_disk(size);
+        let mut known = loss(120_000_000_000);
+        known.apply_repair(capacity::Repair::Partition(size), 5);
+        let state = test_state(&disk, Some(known));
+        let other = disks::Disk {
+            partitions: vec![disks::Partition { offset: MIB, size, id: "OTHER".into() }],
+            ..disk.clone()
+        };
+        // the window showed the layout of another drive; none at all is refused too
+        assert_eq!(plan_repair(&state, &disk, "limit", size, None, key(&other)).unwrap_err().0, "errRepairChanged");
+        assert_eq!(plan_repair(&state, &disk, "limit", size, None, None).unwrap_err().0, "errRepairChanged");
+        assert_eq!(plan_repair(&state, &disk, "limit", size, None, key(&disk)).unwrap().0, size);
+    }
+
+    #[test]
+    fn no_test_store_has_a_path() {
+        // a store made by a test never writes: nothing in the test suite touches the real config folder
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, Some(loss(8_303_673_344)));
+        assert!(lock(&state).store.save_job().is_none());
+    }
+
+    #[test]
+    fn a_full_check_that_wrote_almost_nothing_is_an_error_and_changes_nothing() {
+        let disk = disks::Disk {
+            partitions: vec![disks::Partition { offset: MIB, size: 8_303_673_344, id: "U".into() }],
+            ..test_disk(0)
+        };
+        let state = test_state(&disk, None);
+        let r = finish_full(&state, &disk, Ok(outcome(0, Some("Input/output error"), 512 * 1024)));
+        let (key, args) = r.unwrap_err();
+        assert_eq!(key, "errIo");
+        assert!(args["err"].as_str().unwrap().contains("Input/output"));
+        assert!(lock(&state).capacity.is_empty(), "no record was made");
+        // the plan of the drive is what the layout says: the size of its partition
+        let st = lock(&state);
+        let v = capacity::view_entry(st.capacity.get("disk6"), &disk, 0, false);
+        assert_eq!((v.repair.default, v.repair.limit), (capacity::PlanDefault::Limit, Some(8_303_673_344)));
+    }
 }
