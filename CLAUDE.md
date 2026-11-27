@@ -9,6 +9,9 @@
 
 Rust (edition 2024) + tao 0.37 / wry 0.57 (системный WebView: WKWebView на Mac, WebView2 в Windows). Интерфейс —
 `src/ui/index.html` (HTML/CSS/JS, `include_str!`), тексты — `src/ui/i18n.js` (Rust подставляет вместо `/*I18N*/`).
+Окно 1180×760 (минимум 880×600) без прокрутки страницы: рейка дисков слева, справа полоса диска (карта ёмкости) и одна рабочая
+карточка с вкладками (колонки «настройка» / «итог»; живой график полной проверки `#chartCap` показывается и на вкладке «Реальный объём»).
+Прокручиваются только список дисков, таблица результатов и (в малых окнах) рабочая карточка. Проверка раскладки — `scripts/ui-check`.
 
 - `main.rs` — окно, IPC, состояние (`State` под `Mutex`), одна задача за раз (`start_task`), наблюдатель дисков
   (`disk_watcher`, раз в 2 с / 4 с в Windows), донаты и обновления. `--helper <папка>` и `--cli …` — без окна.
@@ -88,9 +91,24 @@ Rust (edition 2024) + tao 0.37 / wry 0.57 (системный WebView: WKWebView
 
 - `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, `node scripts/check-i18n.mjs`;
   Windows с Mac: `cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings`.
+- Проверка раскладки окна: `node scripts/ui-check/run.mjs --sizes 1180x760,1600x1000,880x600 --engine both` (WKWebView на Mac +
+  headless Chrome/Edge как стенд WebView2; `--states`, `--langs`, `--themes`, `--out <папка PNG>`, `--page <html>`, `--verbose`).
+  Для каждого состояния окна (вкладки × состояния ёмкости/задач × диалоги и тосты) × 5 языков × светлая/тёмная тема проверяет:
+  страница не прокручивается, прокрутка только внутри списка дисков, таблицы результатов и (в малых окнах) рабочей карточки,
+  ни одна кнопка/тик/вердикт не обрезаны, текст не вылезает вбок, у текста с многоточием есть подсказка (это проверка раскладки в
+  WKWebView и headless Chrome, не реального WebView2). Ничего не запускает на дисках и ничего не шлёт в Rust (`send` заменён записью
+  `__sent`). Выходит с кодом 1 при любой ошибке. Контраст токенов: `node scripts/ui-check/contrast.mjs`; те же клики на старой и
+  новой странице: `node scripts/ui-check/ipc.mjs [старый index.html]` (сообщения в Rust должны совпасть); клавиатура и диалоги: `node scripts/ui-check/keys.mjs`. Новый текст/состояние в
+  окне — добавь сценарий в `scripts/ui-check/harness.js`.
 - Языки: en, ru, es, de, zh (`i18n.rs` `LANGUAGES` = ключи `I18N`). Новый ключ — сразу во все 5 языков. Тексты
   доната — в `usbmemorychecker.json` репозитория DeMoZ/donations и в `assets/donations.json` (держать одинаковыми).
 - Релиз: `version` в `Cargo.toml` + `docs/releases/v<версия>.md` (en + ru, их видно в окне обновления) + тег
   `v<версия>` на main. CI выкладывает .dmg, Mac .zip и Windows .zip — **Windows в этом проекте выпускается всегда**
   (так попросил Роман, 2026-11-26).
-- Значок: `scripts/make-icon.sh` → `assets/`.
+- Значок: `scripts/make-icon.sh [--sheet <out.png>]` → `assets/`. `scripts/make-icon.swift` рисует каждый размер
+  отдельно (никаких уменьшений из 1024): до 48 px — упрощённая геометрия с краями по целым пикселям (мелкие размеры
+  подогнаны вручную), от 64 px — с дугой скорости; вариант для Windows (`.ico`) — плитка без отступа, для macOS —
+  по сетке значков с отступом. В `icon.ico` размеры до 48 px лежат как DIB, от 64 — PNG. `--sheet` рисует контактный
+  лист из упакованных `.ico` / `.icns` (1x на светлом и тёмном фоне) — смотри на него после любой правки. Знак в
+  заголовке окна (`index.html`, `.logo`) повторяет 24 px значок: менять вместе. В Windows окно берёт значок из ресурса 1
+  в .exe (`build.rs`) в `main.rs`: tao сам его не ставит.

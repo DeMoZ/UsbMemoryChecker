@@ -25,7 +25,7 @@ if (rustLangs.join() !== Object.keys(I18N).join()) errors.push(`i18n.rs LANGUAGE
 
 const html = readFileSync('src/ui/index.html', 'utf8');
 const used = new Set();
-for (const re of [/data-i18n(?:-title)?="(\w+)"/g, /\bt\('(\w+)'/g, /'(verdict\w+)'/g]) {
+for (const re of [/data-i18n(?:-[a-z]+)?="(\w+)"/g, /\bt\('(\w+)'/g, /'(verdict\w+)'/g]) {
   for (const m of html.matchAll(re)) used.add(m[1]);
 }// t(cond ? 'a' : 'b' ...): both keys
 for (const m of html.matchAll(/\bt\([^()'"]*\?\s*'(\w+)'\s*:\s*'(\w+)'/g)) { used.add(m[1]); used.add(m[2]); }
