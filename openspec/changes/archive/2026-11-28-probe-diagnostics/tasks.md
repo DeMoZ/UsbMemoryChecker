@@ -268,7 +268,7 @@ a running `UsbMemoryChecker.app` instance. Leave no background processes (`pgrep
   Result (2026-11-28): run on a real USB stick, not on a RAM disk. Two runs: Full Disk Access notice shown; report
   `cause: privacy`, `op: open`, `errno: 1`, layout `same`; the open was refused, so nothing was written. The kernel log
   shows the matching `deny(1) file-read-data`. A RAM disk was not tried.
-- [ ] 12.4 For Roman: press "Open Full Disk Access settings" on macOS 27 and confirm that System Settings opens at
+- [x] 12.4 For Roman: press "Open Full Disk Access settings" on macOS 27 and confirm that System Settings opens at
   Privacy & Security → Full Disk Access (or at least System Settings, through the fallback).
 
 ## 13. Review fixes, round 1
