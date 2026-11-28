@@ -1004,27 +1004,27 @@ fn replug_reason(
     Some(Replug { reason, counts })
 }
 
-/// The helper's log shows that the probe may have written (the baseline is done) and has no read-back check.
-fn may_have_written(log: &[String]) -> bool {
-    let stages: Vec<(String, bool)> = log
+/// The replug a run asks for when it ended without a word about its restore (the helper gave no result, or one
+/// without details). With a completed baseline in its log the probe may have written, and whatever came after it
+/// (the read-back check included), the layout was not compared: a replug is always asked for. A read-back check in
+/// the log that failed gives the reason (`mismatch` / `unreadable`), else it is `layoutUnknown`. Without the
+/// baseline nothing was written.
+fn unfinished_replug(log: &[String]) -> Option<Replug> {
+    let lines: Vec<Value> = log.iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if !lines.iter().any(|v| v["stage"] == "baseline" && v["ok"] == true) {
+        return None;
+    }
+    let check: probe::RestoreCheck = lines
         .iter()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| Some((v["stage"].as_str()?.to_string(), v["ok"].as_bool()?)))
-        .collect();
-    stages.iter().any(|(s, ok)| s == "baseline" && *ok) && !stages.iter().any(|(s, _)| s == "verify")
+        .rfind(|v| v["stage"] == "verify" && v["ok"] == false)
+        .and_then(|v| serde_json::from_value(v["info"].clone()).ok())
+        .unwrap_or_default();
+    replug_reason(false, Counts::default(), &check, Some(helper::LayoutAfter::Unreadable))
 }
 
 /// Decides what the end of a quick check means: a trusted outcome or an error, and what the user has to do.
 pub(crate) fn judge_probe(r: &Result<Value, helper::RunError>, log: &[String]) -> Judged {
     let failed = |key, args, fda, replug| Judged { result: Err((key, args)), fda, replug, seen: None };
-    // no word about the restore at all, although the probe may have written: not confirmed
-    let unfinished = || {
-        may_have_written(log)
-            .then(|| {
-                replug_reason(false, Counts::default(), &Default::default(), Some(helper::LayoutAfter::Unreadable))
-            })
-            .flatten()
-    };
     match r {
         Err(helper::RunError::Declined) => failed("errDeclined", json!({}), false, None),
         Err(helper::RunError::Failed { message, cause, details }) => {
@@ -1043,7 +1043,7 @@ pub(crate) fn judge_probe(r: &Result<Value, helper::RunError>, log: &[String]) -
             // keeps it). The helper's flag, not a count: a count can be 0 after writes
             let wrote = details["wrote"].as_bool() != Some(false);
             let replug = if details.is_null() {
-                unfinished()
+                unfinished_replug(log)
             } else {
                 replug_reason(cause == "unresponsive", counts, &check, layout.filter(|_| wrote))
             };
@@ -1064,7 +1064,7 @@ pub(crate) fn judge_probe(r: &Result<Value, helper::RunError>, log: &[String]) -
                 Ok(o) => o,
                 Err(e) => {
                     let args = json!({"err": format!("unreadable probe result: {e}")});
-                    return failed("errHelper", args, false, unfinished());
+                    return failed("errHelper", args, false, unfinished_replug(log));
                 }
             };
             // a result that does not say how the layout looks is not trusted
@@ -1759,6 +1759,44 @@ mod tests {
         // before the baseline nothing was written
         let state = test_state(&disk, None);
         let _ = finish_logged(&state, &disk, &died(), &[line("found"), line("open")]);
+        assert_eq!(notice(&state), None);
+        // a baseline that failed ended the run before the first write
+        let failed_baseline = json!({"t_ms": 1, "stage": "baseline", "ok": false, "info": {}}).to_string();
+        let _ = finish_logged(&state, &disk, &died(), &[line("found"), failed_baseline]);
+        assert_eq!(notice(&state), None);
+    }
+
+    #[test]
+    fn a_helper_that_died_after_the_read_back_check_asks_for_a_replug() {
+        let line =
+            |stage: &str, ok: bool, info: Value| json!({"t_ms": 1, "stage": stage, "ok": ok, "info": info}).to_string();
+        let cases = [
+            (true, json!({"checked": 6000}), "layoutUnknown", 0),
+            (false, json!({"checked": 6000, "mismatched": 2, "unreadable": 3}), "mismatch", 2),
+            (false, json!({"checked": 10, "unreadable": 3}), "unreadable", 3),
+            (false, Value::Null, "layoutUnknown", 0),
+        ];
+        // the device was closed, and the helper died in the remount or in the layout check
+        let died = Err(helper::RunError::failed("the helper stopped without a result"));
+        for (ok, info, reason, n) in cases {
+            let (disk, known) = repaired();
+            let state = test_state(&disk, Some(known.clone()));
+            let log = [
+                line("baseline", true, json!({})),
+                line("restore", true, json!({"writes": 10, "restoreFailures": 0})),
+                line("verify", ok, info),
+                line("closed", true, json!({})),
+            ];
+            assert_eq!(finish_logged(&state, &disk, &died, &log).unwrap_err().0, "errHelper");
+            let replug = notice(&state).and_then(|n| n.replug).expect(reason);
+            assert_eq!((replug.reason, replug.counts["n"].as_u64()), (reason, Some(n)));
+            assert_eq!(knowledge(&state), known);
+        }
+        // a result that says nothing was written asks for none, whatever the log holds
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, None);
+        let details = json!({"restoreCheck": {}, "layoutAfter": "unreadable", "wrote": false});
+        let _ = finish_logged(&state, &disk, &helper_error("cancelled", details), &[line("baseline", true, json!({}))]);
         assert_eq!(notice(&state), None);
     }
 

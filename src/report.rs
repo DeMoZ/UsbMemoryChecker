@@ -485,7 +485,11 @@ impl Report {
             restore_check,
             flush,
             layout_before,
-            layout_after: value_or_null(details.get("layoutAfter")),
+            // a helper that died after its layout check has it in the log only
+            layout_after: details
+                .get("layoutAfter")
+                .cloned()
+                .unwrap_or_else(|| value_or_null(self.stage_info("layout").and_then(|l| l.get("result")))),
             access: value_or_null(details.get("access")),
         });
         self
@@ -897,6 +901,40 @@ mod tests {
         assert_eq!(v["probe"]["counts"]["ioErrors"], 1882);
         assert_eq!(v["probe"]["grid"]["coarseBlocks"], 1882);
         assert_eq!(v["probe"]["layoutAfter"], Value::Null);
+    }
+
+    #[test]
+    fn report_of_a_helper_that_died_after_the_read_back_check() {
+        let d = private_disk();
+        let died: Result<Value, RunError> = Err(RunError::failed("the helper stopped without a result"));
+        let mut log = vec![
+            line("baseline", true, json!({"step": 67_108_864, "points": 1875, "coarseBlocks": 1882})),
+            line("restore", true, json!({"writes": 1890, "restoreFailures": 0})),
+            line("flush", true, json!({"result": "ok"})),
+            line(
+                "verify",
+                false,
+                json!({"checked": 6000, "mismatched": 1, "first": [{"offset": 0, "kind": "mismatch"}]}),
+            ),
+            line("closed", true, json!({})),
+        ];
+        let build = |log: &[String]| {
+            let judged = crate::judge_probe(&died, log);
+            let mut r = report().probe_data(log, &died, &d, &home()).ended(judged.outcome_part(&died), &d, &home());
+            serde_json::from_str::<Value>(&json_of(&mut r)).unwrap()
+        };
+        let v = build(&log);
+        assert_eq!(v["outcome"]["key"], "errHelper");
+        assert_eq!(v["outcome"]["trusted"], false);
+        assert_eq!(v["outcome"]["notice"], "mismatch");
+        assert_eq!(v["probe"]["restoreCheck"]["mismatched"], 1);
+        assert_eq!(v["probe"]["restoreCheck"]["first"][0]["offset"], 0);
+        assert_eq!(v["probe"]["counts"]["restoreFailures"], 0);
+        assert_eq!(v["probe"]["flush"], "ok");
+        assert_eq!(v["probe"]["layoutAfter"], Value::Null, "the layout was never compared");
+        // it died after the layout check: the report takes it from the log
+        log.push(line("layout", true, json!({"result": "same"})));
+        assert_eq!(build(&log)["probe"]["layoutAfter"], "same");
     }
 
     #[test]

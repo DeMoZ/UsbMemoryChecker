@@ -180,6 +180,25 @@ ended as "stopped answering" SHALL still ask for one.
   not "same"
 - **THEN** no replug is asked for
 
+### Requirement: A check that ended without word about its restore asks for a replug
+When a quick check ends with no usable result (none, no details, or unreadable) and its log shows a completed
+baseline, the application SHALL ask for a replug, also when the log holds the read-back check. A failed check there
+SHALL give the reason (blocks read back different, else blocks not read); otherwise the reason SHALL be that the
+layout could not be checked. Without a completed baseline no replug SHALL be asked for.
+
+#### Scenario: The helper dies after a good read-back check
+- **WHEN** the log holds a completed baseline and a read-back check that passed, and the helper stops before it writes
+  its result
+- **THEN** nothing is recorded, and the replug notice says that the partition layout could not be checked
+
+#### Scenario: The helper dies after a failed read-back check
+- **WHEN** the helper stops without a result after a read-back check that found mismatched blocks
+- **THEN** the replug notice names the blocks that read back different, and the report holds that check
+
+#### Scenario: The helper dies before the baseline is complete
+- **WHEN** the log has no completed baseline
+- **THEN** no replug is asked for
+
 ### Requirement: No task runs on a drive that waits for a replug
 While the replug notice is pending for a drive, the application SHALL refuse to start a speed test, a check or a
 repair on it with `errReplugFirst`, and the window SHALL disable those actions. The notice SHALL end when the drive

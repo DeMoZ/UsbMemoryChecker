@@ -92,6 +92,21 @@ result files) as a new file that is not a link, and SHALL never open an existing
 - **WHEN** the temporary progress file name is a symbolic link while the helper runs
 - **THEN** the helper does not write through it, and the next progress update uses a new file
 
+### Requirement: The elevated helper stays inside the job folder
+On every system the helper SHALL create, change and remove nothing outside the job folder it opened. It SHALL read the
+job file only when that is a plain file with a single name (on macOS also owned by the folder's owner), and SHALL copy
+nothing of a refused file into its result.
+
+#### Scenario: A hard link as the job file
+- **WHEN** `job.json` is a hard link to another file
+- **THEN** the helper does not read it, the result says that the job could not be read, and holds none of that file's
+  content
+
+#### Scenario: Windows folder turned into a junction before the log exists
+- **WHEN** on Windows the empty job folder is turned into a junction after the helper has opened it and before it has
+  created `log.jsonl`
+- **THEN** nothing is created in the target of the junction
+
 ### Requirement: Reports are kept for a limited time
 Each time a report is written, the application SHALL delete the report files that are older than 90 days, and then
 the oldest ones until at most 50 remain. It SHALL delete only files whose names match the report pattern.

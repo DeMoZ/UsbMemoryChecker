@@ -130,13 +130,12 @@ pub fn fix_size(job: &Job) -> Result<u64, String> {
 /// link later changes nothing.
 ///
 /// Unix: a directory descriptor (`O_DIRECTORY | O_NOFOLLOW`) with `openat` / `renameat` / `unlinkat`.
-/// Windows has no such calls here: the folder is held open without delete sharing, so it cannot be renamed or
-/// removed, and the event log stays open inside it (also without delete sharing), so the folder is never empty and
-/// cannot be turned into a junction ([`JobFolder::create_log`] checks that the log really is inside it).
+/// Windows: a handle to the folder without delete sharing (no rename or removal), with `NtCreateFile` relative to
+/// it. The event log stays open inside it, also without delete sharing.
 pub struct JobFolder {
     #[cfg(unix)]
     dir: File,
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     path: PathBuf,
     #[cfg(windows)]
     pin: File,
@@ -179,9 +178,18 @@ impl JobFolder {
         self.create_new("log.jsonl")
     }
 
+    /// The content of a file of the folder: a regular file with this one name, owned by the folder's owner. Anything
+    /// else (a hard link to a file only root may read, say) is refused before a byte of it is read, so none of it
+    /// can end up in an error text of the result.
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::MetadataExt;
+        let mut file = self.open_at(name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let found = file.metadata()?;
+        if !is_own_file(found.is_file(), found.nlink(), found.uid(), self.dir.metadata()?.uid()) {
+            return Err(not_a_job_file());
+        }
         let mut data = Vec::new();
-        io::Read::read_to_end(&mut self.open_at(name, libc::O_RDONLY | libc::O_NONBLOCK)?, &mut data)?;
+        io::Read::read_to_end(&mut file, &mut data)?;
         Ok(data)
     }
 
@@ -212,86 +220,225 @@ impl JobFolder {
     }
 }
 
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-/// `FILE_SHARE_READ | FILE_SHARE_WRITE`: others may read and write, nobody may rename or delete.
-#[cfg(windows)]
-const SHARE_NO_DELETE: u32 = 0x1 | 0x2;
-
-/// The path of an open file or folder as the system resolved it.
-#[cfg(windows)]
-fn final_path(file: &File) -> io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-    let mut buf = vec![0u16; 32_768];
-    // SAFETY: the handle is open and the buffer has the length given.
-    let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, 0) };
-    if n == 0 || n as usize >= buf.len() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize])))
+/// A file that may be read as a job file.
+#[cfg(unix)]
+fn is_own_file(regular: bool, links: u64, owner: u32, folder_owner: u32) -> bool {
+    regular && links == 1 && owner == folder_owner
 }
 
-#[cfg(not(unix))]
+#[cfg(any(unix, windows))]
+fn not_a_job_file() -> io::Error {
+    io::Error::other("not a plain file of the job folder")
+}
+
+/// Windows: every file is opened relative to the held folder (`NtCreateFile` with `RootDirectory`), as `openat`
+/// does, so the folder's path is never followed again. `OBJ_DONT_REPARSE` makes an open that would have to go
+/// through a reparse point fail (the held folder turned into a junction while it was still empty, say), and
+/// `FILE_OPEN_REPARSE_POINT` opens a link in a file's place as the link itself.
+#[cfg(windows)]
 impl JobFolder {
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE`: others may read and write, nobody may rename or delete.
+    const SHARE_NO_DELETE: u32 = 0x1 | 0x2;
+    const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+
     /// An error when `path` is not a real folder (a link or a junction to one included).
     pub fn open(path: &Path) -> io::Result<Self> {
-        let not_a_folder = || io::Error::other("not a folder");
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-            let pin = OpenOptions::new()
-                .read(true)
-                .share_mode(SHARE_NO_DELETE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)?;
-            let attributes = pin.metadata()?.file_attributes();
-            if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(not_a_folder());
-            }
-            Ok(JobFolder { path: path.to_path_buf(), pin })
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let pin = OpenOptions::new()
+            .read(true)
+            .share_mode(Self::SHARE_NO_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let attributes = pin.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::other("not a folder"));
         }
-        #[cfg(not(windows))]
-        {
-            if !std::fs::symlink_metadata(path)?.is_dir() {
-                return Err(not_a_folder());
-            }
-            Ok(JobFolder { path: path.to_path_buf() })
-        }
+        Ok(JobFolder { pin })
     }
 
-    fn options() -> OpenOptions {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    /// Opens or creates the file `name` (a single name, never a path) inside the held folder.
+    fn open_at(&self, name: &str, access: u32, share: u32, disposition: u32) -> io::Result<File> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        };
+        use windows_sys::Win32::Foundation::{
+            OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SYNCHRONIZE};
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        let bytes = (wide.len() * 2) as u16;
+        let object_name = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: self.pin.as_raw_handle() as _,
+            ObjectName: &object_name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: plain data that the call fills in.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: the folder's handle is open; the name and the attributes outlive the call.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                access | SYNCHRONIZE,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: only translates the code.
+            return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
         }
-        options
+        // SAFETY: a new handle that nothing else owns.
+        Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    fn create_shared(&self, name: &str, share: u32) -> io::Result<File> {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+        self.open_at(name, FILE_GENERIC_WRITE, share, FILE_CREATE)
+    }
+
+    /// An existing entry of the folder (a link itself, never its target).
+    fn open_existing(&self, name: &str, access: u32) -> io::Result<File> {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        self.open_at(name, access, Self::SHARE_ALL, FILE_OPEN)
     }
 
     /// A new file; an existing file or a link in its place is an error.
     fn create_new(&self, name: &str) -> io::Result<File> {
-        Self::options().open(self.path.join(name))
+        self.create_shared(name, Self::SHARE_ALL)
     }
 
-    /// The event log. On Windows it also pins the folder for as long as it is open.
+    /// The event log. Nobody can delete or rename it while it is open.
     fn create_log(&self) -> io::Result<File> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            let log = Self::options().share_mode(SHARE_NO_DELETE).open(self.path.join("log.jsonl"))?;
-            if final_path(&log)?.parent() != Some(final_path(&self.pin)?.as_path()) {
-                return Err(io::Error::other("the job folder was replaced"));
-            }
-            Ok(log)
+        self.create_shared("log.jsonl", Self::SHARE_NO_DELETE)
+    }
+
+    /// The content of a file of the folder: not a link, and with this one name (no hard link to another file).
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
+            GetFileInformationByHandle,
+        };
+        let mut file = self.open_existing(name, FILE_GENERIC_READ)?;
+        // SAFETY: plain data that the call fills in.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is open.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
         }
-        #[cfg(not(windows))]
+        let other = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+        if info.dwFileAttributes & other != 0 || info.nNumberOfLinks != 1 {
+            return Err(not_a_job_file());
+        }
+        let mut data = Vec::new();
+        io::Read::read_to_end(&mut file, &mut data)?;
+        Ok(data)
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        self.open_existing(name, FILE_READ_ATTRIBUTES).is_ok()
+    }
+
+    /// Removes the entry (a link itself, never its target).
+    fn remove(&self, name: &str) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        };
+        let file = self.open_existing(name, DELETE)?;
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open and the information has the size given. The file goes when it is closed.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                FileDispositionInfo,
+                (&raw const info).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        };
+        if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Renames `from` to `to` inside the folder, replacing `to`. A simple rename (no root, a bare name) stays in
+    /// the folder the file is in: no path is resolved.
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile};
+        use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError};
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        /// `FILE_RENAME_INFORMATION` with room for the name.
+        #[repr(C)]
+        struct Rename {
+            /// `ReplaceIfExists` is the first byte.
+            replace: u32,
+            root: HANDLE,
+            length: u32,
+            name: [u16; 64],
+        }
+        let mut info = Rename { replace: 1, root: std::ptr::null_mut(), length: 0, name: [0; 64] };
+        let wide: Vec<u16> = to.encode_utf16().collect();
+        info.name.get_mut(..wide.len()).ok_or_else(|| io::Error::other("name too long"))?.copy_from_slice(&wide);
+        info.length = (wide.len() * 2) as u32;
+        let file = self.open_existing(from, DELETE)?;
+        // SAFETY: plain data that the call fills in.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is open and the information has the size given.
+        let status = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle() as _,
+                &mut status_block,
+                (&raw const info).cast(),
+                std::mem::size_of::<Rename>() as u32,
+                FileRenameInformation,
+            )
+        };
+        if status < 0 {
+            // SAFETY: only translates the code.
+            return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+        }
+        Ok(())
+    }
+}
+
+/// Other systems have no elevated helper that works on a drive: plain paths.
+#[cfg(not(any(unix, windows)))]
+impl JobFolder {
+    /// An error when `path` is not a real folder.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        if !std::fs::symlink_metadata(path)?.is_dir() {
+            return Err(io::Error::other("not a folder"));
+        }
+        Ok(JobFolder { path: path.to_path_buf() })
+    }
+
+    /// A new file; an existing file or a link in its place is an error.
+    fn create_new(&self, name: &str) -> io::Result<File> {
+        OpenOptions::new().write(true).create_new(true).open(self.path.join(name))
+    }
+
+    fn create_log(&self) -> io::Result<File> {
         self.create_new("log.jsonl")
     }
 
@@ -394,7 +541,7 @@ pub fn main(dir: &Path) -> i32 {
             .and_then(|d| serde_json::from_slice::<Job>(&d).map_err(|e| format!("bad job: {e}")))
             .map_err(JobError::from)
             .and_then(|job| run_job(&job, &folder, &mut log)),
-        // without the log the folder is not pinned on Windows, so nothing more is written there
+        // on Windows a folder the log cannot be created in gets nothing more written into it
         Err(e) if cfg!(windows) => {
             eprintln!("the job folder is not safe: {e}");
             return 1;
@@ -1263,6 +1410,58 @@ mod tests {
         let link = t.0.join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(create_job_dir(&link).is_err(), "a link is refused");
+    }
+
+    #[test]
+    fn job_folder_files_are_replaced_removed_and_found() {
+        let t = Temp::new("files");
+        let folder = JobFolder::open(&t.0).unwrap();
+        let log = EventLog::create(&folder).unwrap();
+        assert!(!folder.exists("cancel"));
+        std::fs::write(t.0.join("cancel"), b"").unwrap();
+        assert!(folder.exists("cancel"));
+        for n in [1, 2] {
+            folder.write_json("progress.json", &json!({"n": n}));
+            assert_eq!(folder.read("progress.json").unwrap(), json!({"n": n}).to_string().as_bytes());
+        }
+        assert!(!t.0.join("progress.tmp").exists());
+        folder.remove("cancel").unwrap();
+        assert!(!t.0.join("cancel").exists());
+        drop(log);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_hard_linked_job_file_is_not_read() {
+        let t = Temp::new("hard_link");
+        let job = t.0.join("job");
+        std::fs::create_dir(&job).unwrap();
+        // stands for a file only root may read, given a second name inside the job folder
+        let secret = t.0.join("secret.txt");
+        std::fs::write(&secret, "\"top secret\"").unwrap();
+        std::fs::hard_link(&secret, job.join("job.json")).unwrap();
+        assert!(JobFolder::open(&job).unwrap().read("job.json").is_err());
+        assert_eq!(main(&job), 1);
+        let result = std::fs::read_to_string(job.join("result.json")).unwrap();
+        assert!(result.contains("could not read the job"), "{result}");
+        assert!(!result.contains("top secret"), "{result}");
+        // with one name again it is an ordinary file
+        std::fs::remove_file(&secret).unwrap();
+        assert_eq!(JobFolder::open(&job).unwrap().read("job.json").unwrap(), b"\"top secret\"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_plain_file_of_the_folders_owner_is_a_job_file() {
+        assert!(is_own_file(true, 1, 501, 501));
+        assert!(!is_own_file(false, 1, 501, 501), "not a regular file");
+        assert!(!is_own_file(true, 2, 501, 501), "a second name");
+        assert!(!is_own_file(true, 0, 501, 501), "no name left");
+        assert!(!is_own_file(true, 1, 0, 501), "another owner");
+        // a folder in the file's place
+        let t = Temp::new("not_a_file");
+        std::fs::create_dir(t.0.join("job.json")).unwrap();
+        assert!(JobFolder::open(&t.0).unwrap().read("job.json").is_err());
     }
 
     #[test]

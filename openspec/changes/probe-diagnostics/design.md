@@ -169,8 +169,15 @@ it, and a notice stored earlier could be dropped by one that missed the drive fo
 An access abort before any write has an empty restore check and needs no replug. The helper says whether a write was
 attempted (`ProbeRun.wrote`, in `details.wrote` of a failed run; `false` also for a failed open). It is not inferred
 from a count, which can be 0 after writes. With `wrote: false` the layout plays no part in the replug decision (it
-stays in the report); "stopped answering" still asks for a replug by itself. A missing flag counts as written, and a
-helper that gave no details after the baseline is handled as before (replug, `layoutUnknown`). One with an
+stays in the report); "stopped answering" still asks for a replug by itself. A missing flag counts as written.
+
+A run that ended without a word about its restore (no `result.json`, one without details, or an outcome that cannot
+be read) is judged from the log. With a completed baseline it **always** asks for a replug, also when the log already
+holds the read-back check: the helper can still die while it closes the device, remounts (up to 60 s) or polls the
+layout (up to 10 s), and nobody compared the layout. A `verify` line with `ok: false` gives the reason by what it
+reports (`mismatch`, else `unreadable`); in every other case it is `layoutUnknown`. Without a completed baseline
+nothing was written and no replug is asked for. The report of such a run takes the counts, the read-back check and
+the cache flush from the log; `layoutAfter` stays empty unless the log has the layout line. A run with an
 unconfirmed check gets both the access message and the replug notice. `send_disks` adds `notices` and `reports: {diskN: true}` to the
 `disks` message. Clearing: `FullDiskAccess` goes when the next check (quick or full) of that drive starts; a speed test or a repair
 leaves it. `Replug` goes in
@@ -239,9 +246,21 @@ New IPC actions take no free data:
   Before anything else the helper opens the job folder once (`JobFolder`; Unix `O_DIRECTORY | O_NOFOLLOW`) and then
   reaches every file through that descriptor (`openat`, `unlinkat`, `renameat`), so swapping the folder for a link
   later changes nothing. It refuses the job when the folder is not a real directory, or when `log.jsonl` already
-  exists. Windows has no `openat`: the helper holds the folder open without delete sharing (no rename or removal),
-  keeps `log.jsonl` open without delete sharing (the folder is never empty, so it cannot become a junction), checks
-  with `GetFinalPathNameByHandleW` that the log is inside the held folder, and writes nothing when that fails.
+  exists. Windows does the same with the native calls: the helper holds the folder open without delete sharing (no
+  rename or removal) and creates, opens, reads and removes every file with `NtCreateFile` relative to that handle
+  (`RootDirectory`, a bare name, `FILE_OPEN_REPARSE_POINT`, `OBJ_DONT_REPARSE`); a rename is a simple
+  `NtSetInformationFile(FileRenameInformation)` (no root, a bare name), which stays in the file's folder. No path
+  is resolved after the folder is opened, so a folder turned into a junction while still empty (before `log.jsonl`
+  exists) gets nothing created in the junction's target: the open stays in the held folder or fails.
+  `log.jsonl` stays open without delete sharing. *Rejected:* create by path and check afterwards with
+  `GetFinalPathNameByHandleW` (the first version): the file was already created in the target when the check ran.
+  This relies on the documented meaning of `OBJ_DONT_REPARSE`; it compiles under Windows clippy but has not run on
+  Windows with a junction swap.
+  `job.json` is read only when it is a plain file with one name: on Unix `fstat` must show a regular file with
+  `st_nlink == 1` owned by the folder's owner; on Windows `GetFileInformationByHandle` must show no directory or
+  reparse point and one link. So a hard link to a file only root may read is never read, and none of its text can
+  reach a parse error in `result.json`. The Windows check does not compare owners: that needs the security
+  descriptors and SIDs, and the default owner of a file there depends on the token that created it.
   `write_json` writes its tmp file safely too: it removes any old tmp file (that removes a link, not its target),
   creates it new and renames it. The window reads `log.jsonl` and `result.json` after the helper exits (also when it
   "stopped without a result") and builds the report **as the user**. The job folder is created with

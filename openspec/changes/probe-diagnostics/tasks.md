@@ -285,6 +285,24 @@ a running `UsbMemoryChecker.app` instance. Leave no background processes (`pgrep
 - [x] 13.6 Redaction leaves other words and its own placeholders alone. Test
   `redact_leaves_other_words_and_its_own_placeholders_alone`.
 
+## 14. Review fixes, round 2
+
+- [x] 14.1 A completed baseline without a result always asks for a replug (`unfinished_replug`): `mismatch` /
+  `unreadable` from a failed `verify` line, else `layoutUnknown`; a result with `wrote: false` still asks for none.
+  The report takes `layoutAfter` from the log's layout line when there is no result. Tests
+  `a_helper_that_died_after_the_read_back_check_asks_for_a_replug`,
+  `a_helper_that_died_after_the_baseline_asks_for_a_replug`,
+  `report_of_a_helper_that_died_after_the_read_back_check`.
+- [x] 14.2 Windows `JobFolder`: every file is created, opened, removed and renamed relative to the held folder
+  (`NtCreateFile` + `OBJ_DONT_REPARSE`, simple `NtSetInformationFile` rename). Compiles under Windows clippy; test
+  `job_folder_files_are_replaced_removed_and_found` runs on macOS and, in CI, on Windows. No test swaps the folder
+  for a junction.
+- [x] 14.3 `job.json` is read only as a plain file with one name (Unix: also the folder's owner). Tests
+  `a_hard_linked_job_file_is_not_read`, `only_a_plain_file_of_the_folders_owner_is_a_job_file`.
+- [ ] 14.4 CI on Windows: `cargo test` passes there (`a_hard_linked_job_file_is_not_read`,
+  `job_folder_files_are_replaced_removed_and_found`, `log_lines_are_json` exercise the native calls). Not runnable on
+  the Mac; checked after the branch is pushed.
+
 ## Workflow follow-up
 
 - Review (Opus, high effort) of the diff against these specs; findings go back to an executor, then a new review,
