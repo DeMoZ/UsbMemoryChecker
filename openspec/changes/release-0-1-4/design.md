@@ -20,9 +20,10 @@ See proposal.md for why. Facts this design rests on (read on 2026-11-28 at main 
   `textContent`; `.notes` is `white-space: pre-wrap`, `font-size: var(--fs-s)`, `max-height: 200px`, scrolls inside,
   in a modal at most 480 px wide. So the text is shown raw: `**bold**` shows its asterisks, backticks stay, and every
   line break in the file is a line break on screen. Both language sections are always shown, whatever the UI
-  language. v0.1.0–v0.1.3 all have the same `release_notes` and `.notes` rules (checked with `git show
-  <tag>:src/update.rs` and `:src/ui/index.html`), and it is the **installed old version** that renders the notes of
-  the new one.
+  language. v0.1.0–v0.1.3 all have the same `release_notes` rules and render the text the same way (`pre-wrap` and
+  `textContent`). Only the size of the box differs: v0.1.0–v0.1.2 use `font-size: 13px` and `max-height: 220px`,
+  v0.1.3 uses `var(--fs-s)` and `200px` (checked with `git show <tag>:src/update.rs` and `:src/ui/index.html`). It
+  is the **installed old version** that renders the notes of the new one.
 - **Signature.** `scripts/build-macos.sh` signs the app ad hoc (`codesign --force --deep --sign -`). The archived
   probe-diagnostics design records `codesign -d -r-` on the installed v0.1.3: `designated => cdhash H"…"`,
   `Signature=adhoc`, no team. Every build has a different cdhash, so a different designated requirement.
