@@ -129,7 +129,7 @@ commit. No AI attribution anywhere; commit messages in English.
   `rustup target add x86_64-pc-windows-msvc`), then `cargo clippy --all-targets --target x86_64-pc-windows-msvc --
   -D warnings` passes. Verify: exit code 0.
   Done: the target was already installed; exit code 0, no warnings.
-- [ ] 4.6 Local mirror of the CI macOS packaging: `scripts/build-macos.sh` (it runs `cargo test`, builds
+- [x] 4.6 Local mirror of the CI macOS packaging: `scripts/build-macos.sh` (it runs `cargo test`, builds
   `aarch64-apple-darwin`, signs ad hoc, writes the gitignored `dist/`). Do not open the `.dmg` and do not start the
   built `.app`. Verify: `ls dist` shows `UsbMemoryChecker.app`, `UsbMemoryChecker-macOS.dmg` and
   `UsbMemoryChecker-0.1.4-macos-arm64.zip`; `plutil -extract CFBundleShortVersionString raw
@@ -143,6 +143,9 @@ commit. No AI attribution anywhere; commit messages in English.
   `Signature=adhoc`, no `dist/` in `git status`. The `.dmg` is left to CI on the PR. Each failed `hdiutil create` left
   its own temporary image mounted at `/Volumes/UsbMemoryChecker` (or `UMCctl`); those images (identified by their
   backing file, protocol Disk Image) were detached and the script's leftover staging folder removed.
+  CLOSED ON CI EVIDENCE (not locally): PR #15 run 46115724630, runner `macos-26-arm64`, the unchanged script printed
+  `Done: dist/UsbMemoryChecker.app, dist/UsbMemoryChecker-macOS.dmg, dist/UsbMemoryChecker-0.1.4-macos-arm64.zip`
+  after 289 passing tests. The review reproduced the local `hdiutil` failure outside the repo.
 - [x] 4.7 The ui-check scripts are not needed: `git diff --stat 3ee8aff -- src scripts .github README.md
   README.ru.md CLAUDE.md openspec/specs` prints nothing, so no window, script, workflow, README or spec changed
   (design D9; the real window was checked in 3.4). Compare the real app folders with 1.2 (same `ls -la` into
