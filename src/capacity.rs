@@ -104,6 +104,13 @@ pub struct CheckRecord {
     pub points: usize,
     pub seconds: f64,
     pub restore_failures: usize,
+    /// Quick check: points read back different, points with a read or write error, blocks not written because their
+    /// old content could not be read.
+    pub io_errors: usize,
+    pub mismatches: usize,
+    pub unsaved: usize,
+    /// Quick check: the blocks written back were read again and matched.
+    pub restore_checked: bool,
     /// The full check ended before it covered the volume (a write error, or clearly less written than the free
     /// space): its pass says nothing about the rest, and it never counts as "verified".
     pub cut_short: bool,
@@ -959,6 +966,7 @@ mod tests {
             partitions,
             table_unreadable: false,
             table_id: String::new(),
+            partition_fs: Vec::new(),
         }
     }
 
@@ -982,6 +990,37 @@ mod tests {
     }
 
     // ---- layout
+
+    #[test]
+    fn old_record_without_counts_loads() {
+        // a check as the version before the counts wrote it
+        let old = r#"{"mode":"quick","scope":"device","verdict":"fake","real":8303673344,"declared":125829120000,
+            "volume":0,"tested":0,"bad":0,"stoppedEarly":false,"writeError":null,"points":1875,"seconds":7.0,
+            "restoreFailures":0,"cutShort":false,"nearlyFull":false,"at":1000}"#;
+        let rec: CheckRecord = serde_json::from_str(old).unwrap();
+        assert_eq!((rec.io_errors, rec.mismatches, rec.unsaved, rec.restore_checked), (0, 0, 0, false));
+        assert_eq!((rec.points, rec.real), (1875, PART));
+    }
+
+    #[test]
+    fn counts_survive_the_store() {
+        let path = temp_path("counts");
+        let mut k = repaired_k_with_repair(PART);
+        k.apply_quick(CheckRecord {
+            io_errors: 1700,
+            mismatches: 50,
+            unsaved: 3,
+            restore_checked: true,
+            ..rec(Mode::Quick, Scope::Device, Verdict::Fake, PART)
+        });
+        let mut store = Store::default();
+        store.put(None, fp(DECLARED, MIB, PART, UUID), k.clone(), 1);
+        store.save_to(&path).unwrap();
+        let back = Store::load_from(&path).find(&fp(DECLARED, MIB, PART, UUID), 2).unwrap();
+        let last = back.last.unwrap();
+        assert_eq!((last.io_errors, last.mismatches, last.unsaved, last.restore_checked), (1700, 50, 3, true));
+        cleanup(&path);
+    }
 
     #[test]
     fn margin_values() {

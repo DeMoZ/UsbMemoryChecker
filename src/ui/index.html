@@ -237,8 +237,14 @@ td .bad-text { display: block; color: var(--bad); font-size: var(--fs-xs); font-
 .split .f { flex: 1; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px; color: var(--bad); white-space: nowrap;
   background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--bad) 24%, transparent) 0 6px, color-mix(in srgb, var(--bad) 9%, transparent) 6px 12px); }
 .verdict .actions { margin-top: 10px; }
+.cap-notice { display: none; flex-direction: column; gap: 12px; }
+.cap-notice.on { display: flex; }
+.cap-notice .verdict p + p { margin-top: 6px; }
+.linkbtn { border: 0; padding: 0; background: transparent; cursor: pointer; color: var(--signal); font-size: inherit; text-decoration: underline; text-underline-offset: 2px; }
 .idle-card { flex: 1; min-height: 120px; border-radius: var(--r-l); box-shadow: inset 0 0 0 1px var(--line); display: none; place-items: center; text-align: center; color: var(--text-3); font-size: var(--fs-s); padding: 16px; }
 .idle-card.on { display: grid; }
+.idle-report { margin-top: 8px; }
+.idle-report:empty { display: none; }
 .idle-card svg { width: 26px; height: 26px; color: var(--edge); display: block; margin: 0 auto 8px; }
 
 /* notes, ticks, repair */
@@ -459,13 +465,14 @@ td .bad-text { display: block; color: var(--bad); font-size: var(--fs-xs); font-
             </div>
             <div class="col">
               <div class="note info" id="capNote" style="display:none"><svg><use href="#i-info"/></svg><span id="capNoteText"></span></div>
+              <div class="cap-notice" id="capNotice"></div>
               <div class="verdict" id="verdict"></div>
               <div class="chart" id="chartCapBox" style="display:none">
                 <canvas id="chartCap"></canvas>
                 <div class="legend"><span><i style="background:var(--signal)"></i><span data-i18n="legendWrite"></span></span><span><i style="background:var(--violet)"></i><span data-i18n="legendRead"></span></span></div>
                 <div class="empty-c" id="chartCapEmpty" data-i18n="chartEmpty"></div>
               </div>
-              <div class="idle-card" id="capIdle"><div><svg><use href="#i-scan"/></svg><span data-i18n="capText"></span></div></div>
+              <div class="idle-card" id="capIdle"><div><svg><use href="#i-scan"/></svg><span data-i18n="capText"></span><div class="idle-report" id="capIdleReport"></div></div></div>
             </div>
           </div>
 
@@ -588,6 +595,8 @@ let disks = [], disksLoaded = false, selected = null, tab = 'speed';
 let task = null;            // {kind, disk, fraction, stage, mbps, started}
 const results = {};         // disk id -> {speed: [], repaired: size, ...}: what only this window knows
 let capacity = {};          // disk id -> capacity view worked out by Rust (state, check, repair plan)
+let notices = {};           // disk id -> what the last quick check asks of the user (Full Disk Access, replug)
+let reports = {};           // disk id -> true: there is a report to show
 let rescanSeq = 0, rescanPending = 0, rescanTimer = null;
 let series = { write: [], read: [] }, seriesDisk = null, seriesKind = null;
 let update = { checking: false, downloading: false, available: null, writable: false, status: null };
@@ -705,6 +714,8 @@ function volOf(d) { return d.volumes.filter(v => v.writable).sort((a, b) => b.to
 function res(id) { return results[id] || (results[id] = { speed: [], repaired: 0 }); }
 function cap(id) { return capacity[id] || null; }
 function current() { return disks.find(d => d.id === selected) || null; }
+// a drive that waits to be unplugged: nothing may run on it (Rust refuses too)
+function waitsForReplug(id) { const n = notices[id]; return !!n && n.kind === 'replug'; }
 
 // state of a drive for the rail: [class, icon, tooltip text]
 function stateInfo(d) {
@@ -869,6 +880,11 @@ function renderProgress() {
     b.title = fits(+b.dataset.mb) ? '' : t('sizeNoFit', { free: fmtBytes(free) });
   });
   if (d && !fits(speedMb)) $('speedBtn').disabled = true;
+  const waiting = !!d && waitsForReplug(d.id);
+  for (const id of ['speedBtn', 'capBtn']) {
+    if (waiting) $(id).disabled = true;
+    $(id).title = waiting ? t('errReplugFirst') : '';
+  }
   // the verdict column swaps with the live chart when a full check of this drive starts or ends
   const key = fullRunning() ? 'run' : '';
   if (key !== lastRunKey) { lastRunKey = key; renderVerdict(); requestAnimationFrame(drawCharts); }
@@ -998,7 +1014,14 @@ function renderVerdict() {
   $('capIdle').classList.toggle('on', !k && !running);
   // the first line of the tab is shown in the placeholder instead, when nothing is checked yet
   $('capLead').style.display = k || running ? '' : 'none';
-  if (!k || running) { el.className = 'verdict'; el.innerHTML = ''; return; }
+  // a notice comes first; while a replug is due the last recorded verdict could mislead, so it is hidden
+  const noticed = !running && renderCapNotice(d);
+  const replug = noticed && waitsForReplug(d.id);
+  if (!noticed) renderCapNotice(null);
+  const verdictOn = !!k && !running && !replug;
+  if (noticed) $('capIdle').classList.remove('on');
+  $('capIdleReport').innerHTML = !verdictOn && !noticed && d && reports[d.id] ? reportLink() : '';
+  if (!verdictOn) { el.className = 'verdict'; el.innerHTML = ''; return; }
   let cls = { genuine: 'ok', fake: 'bad', damaged: 'warn', broken: 'bad' }[k.verdict];
   const ic = { genuine: 'shield', fake: 'x', damaged: 'alert', broken: 'x' }[k.verdict];
   let title, text;
@@ -1030,9 +1053,49 @@ function renderVerdict() {
   const action = canRepair
     ? `<div class="actions"><button class="btn danger small" onclick="showTab('repair')">${icon('wrench')}${esc(t('btnRepairTo', { size: fmtBytes(c.repair.limit) }))}</button></div>` : '';
   const when = c.remembered && k.at ? t('capRemembered', { date: new Date(k.at * 1000).toLocaleDateString(LOCALE[lang] || 'en-US') }) : '';
-  const faint = [k.seconds ? t('checkedIn', { time: fmtTime(k.seconds) }) : '', when, k.restoreFailures ? t('restoreFailures', { n: k.restoreFailures }) : ''].filter(Boolean).join(' · ');
+  const count = (key, n) => n > 0 ? t(key, { n: nf(n, 0) }) : '';
+  const parts = [k.seconds ? t('checkedIn', { time: fmtTime(k.seconds) }) : '', when,
+    count('countMismatch', k.mismatches), count('countIo', k.ioErrors), count('countUnsaved', k.unsaved),
+    k.restoreFailures ? t('restoreFailures', { n: k.restoreFailures }) : '', k.restoreChecked ? t('restoreVerified') : ''].filter(Boolean).map(esc);
+  // the report link belongs to the notice when there is one
+  if (reports[d.id] && !noticed) parts.push(reportLink());
+  const faint = parts.join(' · ');
   el.className = 'verdict on ' + cls;
-  el.innerHTML = `<div class="vi">${icon(ic)}</div><div><h4>${esc(title)}</h4><p>${esc(text)}</p>${split}${faint ? `<div class="faint">${esc(faint)}</div>` : ''}${action}</div>`;
+  el.innerHTML = `<div class="vi">${icon(ic)}</div><div><h4>${esc(title)}</h4><p>${esc(text)}</p>${split}${faint ? `<div class="faint">${faint}</div>` : ''}${action}</div>`;
+}
+
+// ============================================================ notices and reports
+function reportLink() { return `<button class="linkbtn" onclick="showReport()">${esc(t('showReport'))}</button>`; }
+function showReport() { if (selected) send('reveal_report', { disk: selected }); }
+function openPrivacy() { send('open_privacy'); }
+
+// Why the drive has to be unplugged: the text of the reason, with its number
+function replugReasonText(n) {
+  const key = { unresponsive: 'replugUnresponsive', restoreFailed: 'replugRestoreFailed', tableGone: 'replugTableGone', mismatch: 'replugMismatch',
+    unreadable: 'replugUnreadable', layoutChanged: 'replugLayoutChanged', driveGone: 'replugDriveGone', layoutUnknown: 'replugLayoutUnknown' }[n.reason] || 'replugLayoutUnknown';
+  return t(key, { n: nf((n.counts && n.counts.n) || 0, 0) });
+}
+
+// Draws the notice block of the drive; true when there is anything in it
+function renderCapNotice(d) {
+  const n = d && notices[d.id];
+  const cards = [];
+  const card = (cls, ic, title, body) => `<div class="verdict on ${cls}"><div class="vi">${icon(ic)}</div><div><h4>${esc(title)}</h4>${body}</div></div>`;
+  if (n && n.kind === 'replug') {
+    const c = n.counts || {};
+    const counts = [['countMismatch', c.mismatches], ['countIo', c.io], ['countUnsaved', c.unsaved]]
+      .filter(x => x[1] > 0).map(x => t(x[0], { n: nf(x[1], 0) })).join(' · ');
+    cards.push(card('bad', 'alert', t('replugTitle'), `<p>${esc(replugReasonText(n))}</p>${counts ? `<p class="num">${esc(counts)}</p>` : ''}<p>${esc(t('replugText'))}</p>`));
+  }
+  // macOS only: nothing else has this protection
+  if (n && n.fda && platform === 'macos') {
+    cards.push(card('warn', 'shield', t('fdaTitle'), `<p>${esc(t('fdaSteps'))}</p><p>${esc(t('fdaUpdate'))}</p><div class="actions"><button class="btn primary small" id="fdaBtn" onclick="openPrivacy()">${icon('shield')}${esc(t('fdaButton'))}</button></div>`));
+  }
+  if (cards.length && reports[d.id]) cards.push(`<div class="hint">${reportLink()}</div>`);
+  const box = $('capNotice');
+  box.classList.toggle('on', cards.length > 0);
+  box.innerHTML = cards.join('');
+  return cards.length > 0;
 }
 
 // ============================================================ repair
@@ -1045,6 +1108,8 @@ function repairPlan() {
   const c = cap(d.id);
   const r = c ? c.repair : { default: 'none', limit: null, whole: d.size };
   const state = c ? c.state : 'unknown';
+  // a drive that waits for a replug has no plan at all
+  if (waitsForReplug(d.id)) return { d, c, r, state, plan: 'none', size: 0, offerWhole: false, whole: false, waiting: true };
   // the full declared size is a default only for a drive found genuine; otherwise it is the user's explicit choice
   const offerWhole = r.default !== 'whole' && state !== 'broken' && state !== 'unconfirmed';
   const whole = offerWhole && $('repWhole').checked;
@@ -1056,10 +1121,11 @@ function repairPlan() {
 function renderRepair() {
   const p = repairPlan();
   if (!p) return;
-  const { d, c, r, state, plan, size, offerWhole, whole } = p;
+  const { d, c, r, state, plan, size, offerWhole, whole, waiting } = p;
   const keyOf = { fake: 'repText', damaged: 'repText', repaired: 'repTextLimit', partitionOk: 'repTextLimit', limited: 'repTextLimit' };
   const sizeArgs = { size: fmtBytes(size), real: fmtBytes(c && c.lossReal != null ? c.lossReal : (r.limit || 0)) };
-  if (plan === 'none') $('repLead').textContent = state === 'unconfirmed' ? t('errUnconfirmed') : state === 'broken' ? t('errBroken') : t('errNoPlan');
+  if (waiting) $('repLead').textContent = t('errReplugFirst');
+  else if (plan === 'none') $('repLead').textContent = state === 'unconfirmed' ? t('errUnconfirmed') : state === 'broken' ? t('errBroken') : t('errNoPlan');
   else if (whole && (state === 'fake' || state === 'damaged' || state === 'repaired')) $('repLead').textContent = t('repWholeLeadFake', sizeArgs);
   else if (whole && state === 'limited') $('repLead').textContent = t('repWholeLeadLimited', sizeArgs);
   else if (whole && state === 'partitionOk') $('repLead').textContent = t('repWholeLeadVerified', sizeArgs);
@@ -1070,7 +1136,7 @@ function renderRepair() {
   else $('repLead').textContent = t('repTextFull', { size: fmtBytes(size) });
   $('repSize').textContent = plan === 'none' ? '–' : fmtBytes(size);
   $('repSizeHint').textContent = plan === 'none' ? '' : size < d.size ? t('repSizeFrom', { size: fmtBytes(d.size) }) : t('repSizeFull');
-  const note = state === 'unknown' ? 'repNeedCheck' : (state === 'limited' && plan !== 'none') ? 'repLimitedNote' : '';
+  const note = waiting ? '' : state === 'unknown' ? 'repNeedCheck' : (state === 'limited' && plan !== 'none') ? 'repLimitedNote' : '';
   $('repNote').style.display = note ? 'flex' : 'none';
   if (note) $('repNoteText').textContent = state === 'unknown' ? t('repNeedCheck') : t('repLimitedNote');
   $('repWholeBox').style.display = offerWhole ? 'flex' : 'none';
@@ -1089,6 +1155,7 @@ function renderRepair() {
   });
   $('repConfirmText').textContent = t('repConfirm', { name: d.name });
   $('repBtn').disabled = !!task || !$('repConfirm').checked || plan === 'none';
+  $('repBtn').title = waiting ? t('errReplugFirst') : '';
   const done = res(d.id).repaired;
   $('repDone').classList.toggle('on', !!done);
   $('repDoneText').textContent = done ? t('repDone', { size: fmtBytes(done) }) : '';
@@ -1120,14 +1187,15 @@ function renderRepairOffer(d, r) {
   $('repVerifyText').textContent = t('repVerifyText');
   const waited = Date.now() - (r.repairedAt || 0);
   const ready = repairedVolumeIsNew(d, r);
-  $('repVerifyBtn').disabled = !!task || update.downloading || !!pendingVerify || !ready;
+  $('repVerifyBtn').disabled = !!task || update.downloading || !!pendingVerify || !ready || waitsForReplug(d.id);
+  $('repVerifyBtn').title = waitsForReplug(d.id) ? t('errReplugFirst') : '';
   $('repVerifyStatus').textContent = ready ? '' : t(waited >= VERIFY_GIVE_UP_MS ? 'repVerifyNoMount' : 'repVerifyWaiting');
 }
 
 // the offer is kept until Rust accepts the request (a 'task' message); an error keeps it
 function verifyRepaired() {
   const d = current(), r = d && res(d.id);
-  if (!d || !r || !r.offer || !repairedVolumeIsNew(d, r) || task || update.downloading || pendingVerify) return;
+  if (!d || !r || !r.offer || !repairedVolumeIsNew(d, r) || task || update.downloading || pendingVerify || waitsForReplug(d.id)) return;
   pendingVerify = d.id;
   series = { write: [], read: [] }; seriesDisk = d.id; seriesKind = 'full';
   showTab('capacity');
@@ -1241,6 +1309,8 @@ window.onRustMessage = function (msg) {
         const planKey = c => c ? [c.state, c.repair.default, c.repair.limit, c.repair.whole, c.layoutKey].join('|') : '';
         const before = planKey(capacity[selected]);
         capacity = msg.capacity || {};
+        notices = msg.notices || {};
+        reports = msg.reports || {};
         if (before !== planKey(capacity[selected])) $('repWhole').checked = false;
       }
       disksLoaded = disksLoaded || !!msg.scanned;

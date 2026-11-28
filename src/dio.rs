@@ -191,21 +191,85 @@ pub fn space(path: &Path) -> io::Result<(u64, u64)> {
     }
 }
 
-/// Error that means "no rights / the system blocked the access", not "the drive lost the data".
-pub fn is_access_error(e: &io::Error) -> bool {
-    if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem) {
-        return true;
-    }
-    #[cfg(unix)]
-    if let Some(code) = e.raw_os_error() {
-        return [libc::EPERM, libc::EACCES, libc::EROFS, libc::EBUSY, libc::ENODEV, libc::ENXIO].contains(&code);
+/// Why the system refused an access to a drive: the cause decides what the window says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccessCause {
+    /// macOS privacy protection (TCC): the program has no Full Disk Access. Produced on macOS only.
+    Privacy,
+    /// Another program or a mounted volume holds the drive.
+    Busy,
+    /// A write-protected drive (switch or medium).
+    ReadOnly,
+    /// The drive is not there any more.
+    Gone,
+    /// Anything else the system refuses.
+    Denied,
+}
+
+/// Which table of error codes to use (a parameter, so both are tested on every host).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// only the variant of the host is built outside the tests
+#[allow(dead_code)]
+pub enum Os {
+    Mac,
+    Windows,
+    /// Other Unix systems: the same numbers as macOS, but `EPERM` is no privacy protection.
+    Unix,
+}
+
+fn host_os() -> Os {
+    #[cfg(target_os = "macos")]
+    {
+        Os::Mac
     }
     #[cfg(windows)]
-    if let Some(code) = e.raw_os_error() {
-        // ACCESS_DENIED, WRITE_PROTECT, NOT_READY, SHARING_VIOLATION, LOCK_VIOLATION, DEVICE_NOT_CONNECTED, NO_SUCH_DEVICE
-        return [5, 19, 21, 32, 33, 1167, 433].contains(&code);
+    {
+        Os::Windows
     }
-    false
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Os::Unix
+    }
+}
+
+/// The cause of an error code. `elevated_raw`: the error came from the raw device opened by the elevated helper, where
+/// file permissions do not apply, so `EACCES` means a write-protected medium. None: not an access error.
+pub fn cause_of(code: Option<i32>, kind: io::ErrorKind, os: Os, elevated_raw: bool) -> Option<AccessCause> {
+    use AccessCause::*;
+    let by_code = code.and_then(|code| match os {
+        // the numbers of <errno.h> (the same on macOS and Linux)
+        Os::Mac | Os::Unix => match code {
+            1 => Some(if os == Os::Mac { Privacy } else { Denied }), // EPERM
+            13 => Some(if elevated_raw { ReadOnly } else { Denied }), // EACCES
+            30 => Some(ReadOnly),                                    // EROFS
+            16 => Some(Busy),                                        // EBUSY
+            6 | 19 => Some(Gone),                                    // ENXIO, ENODEV
+            _ => None,
+        },
+        Os::Windows => match code {
+            5 => Some(Denied),             // ACCESS_DENIED
+            19 => Some(ReadOnly),          // WRITE_PROTECT
+            21 | 433 | 1167 => Some(Gone), // NOT_READY, NO_SUCH_DEVICE, DEVICE_NOT_CONNECTED
+            32 | 33 => Some(Busy),         // SHARING_VIOLATION, LOCK_VIOLATION
+            _ => None,
+        },
+    });
+    by_code.or(match kind {
+        io::ErrorKind::PermissionDenied => Some(Denied),
+        io::ErrorKind::ReadOnlyFilesystem => Some(ReadOnly),
+        _ => None,
+    })
+}
+
+/// [`cause_of`] for an error of this system.
+pub fn access_cause(e: &io::Error, elevated_raw: bool) -> Option<AccessCause> {
+    cause_of(e.raw_os_error(), e.kind(), host_os(), elevated_raw)
+}
+
+/// Error that means "no rights / the system blocked the access", not "the drive lost the data".
+pub fn is_access_error(e: &io::Error) -> bool {
+    access_cause(e, false).is_some()
 }
 
 #[cfg(test)]
@@ -241,5 +305,64 @@ mod tests {
         let (free, total) = space(&dir).unwrap();
         assert!(total > 0 && free <= total);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn access_causes_macos() {
+        use AccessCause::*;
+        let mac = |code, raw| cause_of(Some(code), io::ErrorKind::Other, Os::Mac, raw);
+        assert_eq!(mac(1, true), Some(Privacy));
+        assert_eq!(mac(13, true), Some(ReadOnly));
+        assert_eq!(mac(13, false), Some(Denied));
+        assert_eq!(mac(30, true), Some(ReadOnly));
+        assert_eq!(mac(16, true), Some(Busy));
+        assert_eq!(mac(6, true), Some(Gone));
+        assert_eq!(mac(19, true), Some(Gone));
+        assert_eq!(mac(5, true), None);
+        // other Unix systems have no privacy protection behind EPERM
+        assert_eq!(cause_of(Some(1), io::ErrorKind::PermissionDenied, Os::Unix, true), Some(Denied));
+        // a permission error without a code
+        assert_eq!(cause_of(None, io::ErrorKind::PermissionDenied, Os::Mac, true), Some(Denied));
+    }
+
+    #[test]
+    fn access_causes_windows() {
+        use AccessCause::*;
+        let win = |code| cause_of(Some(code), io::ErrorKind::Other, Os::Windows, true);
+        assert_eq!(win(5), Some(Denied));
+        assert_eq!(win(19), Some(ReadOnly));
+        for code in [21, 433, 1167] {
+            assert_eq!(win(code), Some(Gone), "{code}");
+        }
+        for code in [32, 33] {
+            assert_eq!(win(code), Some(Busy), "{code}");
+        }
+        for code in 0..2000 {
+            for kind in [io::ErrorKind::Other, io::ErrorKind::PermissionDenied] {
+                assert_ne!(cause_of(Some(code), kind, Os::Windows, true), Some(Privacy), "{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn is_access_error_unchanged() {
+        #[cfg(unix)]
+        {
+            for code in [libc::EPERM, libc::EACCES, libc::EROFS, libc::EBUSY, libc::ENODEV, libc::ENXIO] {
+                assert!(is_access_error(&io::Error::from_raw_os_error(code)), "{code}");
+            }
+            assert!(!is_access_error(&io::Error::from_raw_os_error(libc::EIO)));
+        }
+        #[cfg(windows)]
+        {
+            for code in [5, 19, 21, 32, 33, 1167, 433] {
+                assert!(is_access_error(&io::Error::from_raw_os_error(code)), "{code}");
+            }
+            // ERROR_IO_DEVICE
+            assert!(!is_access_error(&io::Error::from_raw_os_error(1117)));
+        }
+        assert!(is_access_error(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(is_access_error(&io::Error::from(io::ErrorKind::ReadOnlyFilesystem)));
+        assert!(!is_access_error(&io::Error::other("I/O error")));
     }
 }

@@ -76,6 +76,11 @@ Download the latest release from [Releases](https://github.com/DeMoZ/UsbMemoryCh
 2. **Speed** tab: choose 100 MB, 1 GB or 5 GB and press **Start test**.
 3. **Real capacity** tab: choose **Quick check** (recommended) or **Full check** and press **Check capacity**.
    For the quick check macOS asks for your password, Windows asks for permission.
+
+   **macOS: Full Disk Access.** macOS may block direct access to drives for an app without Full Disk Access, even
+   after the password. The window then says so and has a button that opens the setting. Turn UsbMemoryChecker on in
+   **System Settings → Privacy & Security → Full Disk Access**, then quit the app and open it again. The app is not
+   signed with a stable identity, so after an update you may have to remove it from that list and add it again.
 4. If the drive turns out fake, press **Repair to …**: choose exFAT or FAT32 and a name, and confirm. For how the
    size is chosen, see the **Repair** points above. **This erases the drive** — copy your files off it first.
 
@@ -86,12 +91,39 @@ address bits) or nowhere at all (writes are lost, reads give zeros or garbage); 
 small cache. The probe writes a unique pattern, computed from the address, to points on a power-of-two grid over the
 whole device plus their likely wrap-around targets, from the highest address down; then writes 16 MB at the start to
 flush any cache, and reads every point back. A point whose data came back different is not real. Between the last
-good and the first bad point it repeats with a finer grid until the boundary is known to 1 MB. Before every write the
-old content is read, and at the end everything is written back in reverse order.
+good and the first bad point it repeats with a finer grid until the boundary is known to 1 MB.
+
+**Your data.** No block is written before its old content has been read and kept: a block that cannot be read is not
+written at all. At the end, also after a cancel or an error, everything is written back in reverse order. The drive
+is then asked to flush its cache, and the start of the drive (its first 16 MB and last 1 MB) and every block of the
+first round are read again and compared with what was there before the first write. Blocks that only the later,
+finer rounds wrote are put back but not read again. After the drive is closed and mounted again, its partition layout
+is compared with the one from before. A matching re-read only shows that the drive answers with the old data now; it
+may come from the drive's own memory, and only unplugging it and reading again shows what is on the flash.
+
+**Stopped answering is not "keeps no data".** Points whose data came back different are counted apart from points
+where a read or a write returned an error. If the drive stops answering (the first point or the start of the drive
+fails with an error), the check ends without a verdict. "The drive keeps no data" is said only when data really came
+back different while the start of the drive still answers.
+
+**When to unplug.** If the drive stopped answering, a block could not be written back or reads back different, or the
+partition layout changed or vanished, the result is not saved. The window asks you to unplug the drive, plug it in
+again and check it again, and until the drive has left the list the app starts nothing on it. **Do not format,
+initialize or repair it first, even if the system offers to.**
 
 Very unusual controllers that wrap by a non-power-of-two size may slip past the quick check — the full check catches
 everything, because it really writes the free space and reads it back, stopping shortly (within about 1-2 GB) after
 the drive starts losing data; after an early stop only the written part is checked.
+
+## Reports
+
+Every quick check, full check and repair leaves a small JSON report, also when it failed or was cancelled:
+`~/Library/Logs/UsbMemoryChecker/checks/` on macOS, `%LOCALAPPDATA%\UsbMemoryChecker\logs\checks\` on Windows.
+**Show report** on the **Real capacity** tab opens the folder at the last report of the selected drive; the command
+line prints its path. A report holds the stages, error codes and positions, counts, the read-back and layout checks,
+the drive's model, size and partition offsets, sizes and file systems. It never holds your files or data read from
+the drive (or digests of it), volume names, mount paths, volume UUIDs, disk identifiers, serial numbers, your user
+name or home folder. The newest 50 reports are kept, none older than 90 days. Nothing is sent anywhere.
 
 ## Build from source
 

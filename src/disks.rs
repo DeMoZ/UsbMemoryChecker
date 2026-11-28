@@ -61,6 +61,9 @@ pub struct Disk {
     pub table_unreadable: bool,
     /// Windows: the MBR disk signature (8 hex digits) or the GPT disk GUID. Empty on macOS.
     pub table_id: String,
+    /// File system of each entry of `partitions`, as far as it is known; only the check report uses it.
+    #[serde(skip)]
+    pub partition_fs: Vec<String>,
 }
 
 impl Disk {
@@ -206,6 +209,16 @@ mod mac {
         Partition { offset: info.map(|i| n(i, "PartitionMapPartitionOffset")).unwrap_or(0), size, id: id.to_string() }
     }
 
+    /// The file system of a partition: what is mounted from it, else the type of the table entry.
+    fn partition_fs_name(entry: &Dictionary, info: Option<&Dictionary>) -> String {
+        let from_info = |k| info.map(|i| s(i, k)).unwrap_or("");
+        [from_info("FilesystemUserVisibleName"), from_info("FilesystemName"), s(entry, "Content")]
+            .into_iter()
+            .find(|v| !v.is_empty())
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// Builds one listed disk from the parsed `diskutil` output; `info_of` runs `diskutil info -plist <id>`.
     /// `Ok(None)`: not a removable drive (or the boot disk). A partition whose `info` fails or times out only leaves the
     /// drive without a partition table; `Err` is kept for the signature the scan uses (nothing returns it now).
@@ -239,6 +252,7 @@ mod mac {
         let mut info_of = |pid: &str| -> Result<Option<Dictionary>, String> { Ok(info_of(pid).ok()) };
         let mut volumes = Vec::new();
         let mut partitions = Vec::new();
+        let mut partition_fs = Vec::new();
         // a partition whose `diskutil info` failed has no offset: the whole table is then unreliable
         let mut table_complete = true;
         if let Some(v) = volume(info) {
@@ -250,6 +264,7 @@ mod mac {
             let pinfo = info_of(pid)?;
             table_complete &= pinfo.is_some();
             partitions.push(partition_from(part, pinfo.as_ref()));
+            partition_fs.push(partition_fs_name(part, pinfo.as_ref()));
             if let Some(pinfo) = &pinfo {
                 boot |= s(pinfo, "MountPoint") == "/";
                 volumes.extend(volume(pinfo));
@@ -276,6 +291,7 @@ mod mac {
         if !table_complete {
             // no partition table is better than a wrong one: no limited layout, no record is matched or saved
             partitions.clear();
+            partition_fs.clear();
         }
         let name = match s(info, "MediaName").trim() {
             "" => s(info, "IORegistryEntryName").trim().to_string(),
@@ -293,6 +309,7 @@ mod mac {
             partitions,
             table_unreadable: !table_complete,
             table_id: String::new(),
+            partition_fs,
         }))
     }
 
@@ -356,7 +373,7 @@ foreach ($d in Get-Disk) {
   }
   $parts = @()
   foreach ($p in $all) {
-    $parts += [pscustomobject]@{ offset = [uint64]$p.Offset; size = [uint64]$p.Size }
+    $parts += [pscustomobject]@{ offset = [uint64]$p.Offset; size = [uint64]$p.Size; letter = [string]$p.DriveLetter }
   }
   $out += [pscustomobject]@{ number = [int]$d.Number; name = [string]$d.FriendlyName; bus = $bus; size = [uint64]$d.Size; sector = [uint64]$d.LogicalSectorSize; readonly = [bool]$d.IsReadOnly; vols = $vols; parts = $parts; partsfail = [bool]((@($pe | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' }).Count -gt 0) -or ($all.Count -eq 0 -and $d.NumberOfPartitions -gt 0)); sig = [uint32]$d.Signature; guid = [string]$d.Guid }
 }
@@ -382,6 +399,8 @@ ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
         offset: u64,
         #[serde(default)]
         size: u64,
+        #[serde(default)]
+        letter: String,
     }
 
     #[derive(Deserialize)]
@@ -457,6 +476,11 @@ ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
                 table_id: table_id(&d.guid, d.sig),
                 // no partitions although the disk has volumes, or a failed `Get-Partition`: the table is unreadable
                 table_unreadable: d.partsfail || (d.parts.is_empty() && !d.vols.is_empty()),
+                partition_fs: d
+                    .parts
+                    .iter()
+                    .map(|p| d.vols.iter().find(|v| v.letter == p.letter).map_or_else(String::new, |v| v.fs.clone()))
+                    .collect(),
                 partitions: d
                     .parts
                     .iter()
@@ -540,6 +564,7 @@ mod tests {
             partitions: Vec::new(),
             table_unreadable: false,
             table_id: String::new(),
+            partition_fs: Vec::new(),
         };
         assert_eq!(d.main_volume().unwrap().mount, "/c");
     }
