@@ -56,7 +56,7 @@ which is what the user saw.
   and the outcome. It never holds file contents, drive data or digests of them, volume labels, mount paths, volume
   UUIDs or serial numbers. The newest 50 reports are kept, none older than 90 days. The window process writes the
   report as the user. The elevated helper only appends lines to a file in the job folder, which it opens without
-  following symlinks. A "Show report" link in the Real capacity tab reveals the last report of the drive.
+  following symlinks. A "Show report" link in the Real capacity tab reveals the last check report of the drive.
 - The helper's existing `progress.json` / `result.json` writes, which run as root, also stop following symlinks.
 
 ## Capabilities

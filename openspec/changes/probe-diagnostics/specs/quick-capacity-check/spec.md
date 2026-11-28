@@ -136,7 +136,7 @@ none). It SHALL report: same, changed, partition table gone, drive gone, or coul
 ### Requirement: An untrusted result asks for a replug first
 The window SHALL tell the user to unplug the drive, plug it in again and only then check it again, and not to format,
 initialize or repair it first (also not when the system offers to), when the restore is not confirmed, a write-back
-failed, the layout check is not "same", or the run ended as "stopped answering".
+failed, the layout check is neither "same" nor "not compared", or the run ended as "stopped answering".
 
 #### Scenario: The incident, replayed
 - **WHEN** every operation of the coarse round fails with an I/O error, and afterwards the drive lists with no
@@ -152,6 +152,33 @@ failed, the layout check is not "same", or the run ended as "stopped answering".
 #### Scenario: Confirmed restore
 - **WHEN** the restore is confirmed, no write-back failed and the layout is the same
 - **THEN** the verdict is recorded and shown as before, with a note that the restored data read back unchanged
+
+#### Scenario: A scan during the check misses the drive
+- **WHEN** a drive scan taken during the check does not list the drive, and the check then asks for a replug
+- **THEN** the replug notice is pending after the check
+
+### Requirement: A layout unread before the check is not compared
+When the partition table could not be read before the check, there is nothing to compare with: a drive that lists
+afterwards SHALL be reported as not compared (the report records it), and the read-back check alone SHALL decide
+whether the result is trusted. A drive that is gone is still reported as gone, and a scan that does not answer as
+could not be read.
+
+#### Scenario: The table could not be read before the check
+- **WHEN** the partition table of the drive could not be read when the check started, and the drive lists afterwards
+- **THEN** the layout check says "not compared", and the report records that the layout could not be compared
+
+#### Scenario: Unreadable table before the check
+- **WHEN** the table could not be read before the check, the restore is confirmed and no write-back failed
+- **THEN** the verdict is trusted and recorded
+
+### Requirement: A run that wrote nothing is not judged by the layout
+For a run that wrote nothing at all, the layout check SHALL NOT ask for a replug (it stays in the report). A run that
+ended as "stopped answering" SHALL still ask for one.
+
+#### Scenario: Blocked before the first write
+- **WHEN** a check ends (privacy protection, busy drive, cancel) before anything was written, and the layout check is
+  not "same"
+- **THEN** no replug is asked for
 
 ### Requirement: No task runs on a drive that waits for a replug
 While the replug notice is pending for a drive, the application SHALL refuse to start a speed test, a check or a
@@ -208,7 +235,8 @@ opened again, and that after an app update the entry may have to be removed and 
 #### Scenario: The message after a blocked check
 - **WHEN** a quick check ends with the Full Disk Access cause
 - **THEN** the Real capacity tab shows the message with the steps and a button that opens the Full Disk Access pane,
-  in every one of the 5 languages, until the next check of that drive starts
+  in every one of the 5 languages, until the next check of that drive starts (a speed test or a repair does not end
+  it)
 
 ### Requirement: The settings button opens only the privacy pane
 The button SHALL ask the application to open the Full Disk Access pane. The application SHALL open only that fixed

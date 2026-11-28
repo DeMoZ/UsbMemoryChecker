@@ -61,7 +61,8 @@ counts, the first failures and the read-back and layout checks.
 ### Requirement: A report holds no private data
 A report SHALL NOT contain file contents, data read from the drive or digests of it, volume labels, mount paths,
 volume UUIDs, disk GUIDs or signatures, serial numbers, the user name or the home path. Error texts that name a
-label, a mount path or the home folder SHALL have them replaced by `<volume>` or `<home>`.
+label, a mount path or the home folder SHALL have them replaced by `<volume>` or `<home>`. The replacement SHALL NOT reach into other words (a Windows mount `E:` leaves `FILE:` as it
+is) or into a placeholder already put in.
 
 #### Scenario: Error text with the volume path
 - **WHEN** a full check of the volume `PHOTOS` at `/Volumes/PHOTOS` ends with an error whose text contains
@@ -75,12 +76,17 @@ label, a mount path or the home folder SHALL have them replaced by `<volume>` or
 
 ### Requirement: The elevated helper never writes through a link
 The window SHALL create the job folder readable and writable by the owner only. The elevated helper SHALL refuse a
-job folder that is a symbolic link. It SHALL create each file it writes there (its event lines, the progress and
+job folder that is a symbolic link, and SHALL keep using the folder it opened even if its path is replaced later. It
+SHALL create each file it writes there (its event lines, the progress and
 result files) as a new file that is not a link, and SHALL never open an existing file there for writing.
 
 #### Scenario: A planted link
 - **WHEN** `log.jsonl` in the job folder is a symbolic link to another file before the helper starts
 - **THEN** the helper does not write to the target of the link, and the run ends with an error
+
+#### Scenario: Job folder swapped for a link while the helper runs
+- **WHEN** the job folder's path is replaced by a link to another folder after the helper has opened it
+- **THEN** nothing in the other folder is created, removed or changed
 
 #### Scenario: Progress file replaced by a link
 - **WHEN** the temporary progress file name is a symbolic link while the helper runs
@@ -110,11 +116,15 @@ the rest, and stay below 256 KiB.
 The Real capacity tab SHALL offer "Show report" for the selected drive when a report of a check of that drive was
 written in this run of the program. The link SHALL reveal that file in Finder or Explorer. The application SHALL pick
 the file itself, never a path that the window sends. `--cli probe`, `--cli full` and `--cli fix` SHALL print the
-report path to stderr.
+report path to stderr. A repair report SHALL NOT be what that link shows.
 
 #### Scenario: Show the report of the failed check
 - **WHEN** the last quick check of `disk6` failed, and the user presses "Show report"
 - **THEN** Finder opens with that report selected
+
+#### Scenario: Repair after a check
+- **WHEN** a drive was checked and then repaired, and the user presses "Show report" on the Real capacity tab
+- **THEN** the report of the check is revealed
 
 #### Scenario: Command line
 - **WHEN** `usbmemorychecker --cli probe disk6` ends

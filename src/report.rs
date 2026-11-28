@@ -200,7 +200,7 @@ fn replace_word(text: &str, word: &str, with: &str) -> String {
 }
 
 /// Replaces what looks like a UUID or a GUID (8-4-4-4-12 hexadecimal digits).
-fn replace_uuids(text: &str) -> String {
+fn replace_uuids(text: &str, with: &str) -> String {
     let bytes = text.as_bytes();
     let is_uuid = |w: &[u8]| {
         w.iter().enumerate().all(|(i, c)| match i {
@@ -214,7 +214,7 @@ fn replace_uuids(text: &str) -> String {
         // a match is all ASCII, so both of its ends are character boundaries
         if is_uuid(&bytes[i..i + 36]) {
             out.push_str(&text[done..i]);
-            out.push_str("<uuid>");
+            out.push_str(with);
             i += 36;
             done = i;
         } else {
@@ -225,10 +225,47 @@ fn replace_uuids(text: &str) -> String {
     out
 }
 
+/// What stands for a removed name while the text is being cleaned: private-use characters, which no later
+/// replacement can match (a volume named "volume" or "uuid" must not reach into a placeholder already put in).
+const MARKS: [(&str, &str); 5] = [
+    ("\u{E000}", "<volume>"),
+    ("\u{E001}", "<home>"),
+    ("\u{E002}", "<user>"),
+    ("\u{E003}", "<uuid>"),
+    ("\u{E004}", "<computer>"),
+];
+const VOLUME: &str = MARKS[0].0;
+const HOME: &str = MARKS[1].0;
+const USER: &str = MARKS[2].0;
+const UUID: &str = MARKS[3].0;
+const COMPUTER: &str = MARKS[4].0;
+
+/// A drive letter of Windows as a mount: `E:`.
+fn is_drive_letter(mount: &str) -> bool {
+    matches!(mount.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
+}
+
+/// Replaces a drive letter where no word runs into it: the "E:" of "FILE:" is not the drive E.
+fn replace_drive(text: &str, mount: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for (at, found) in text.match_indices(mount) {
+        if text[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        out.push_str(&text[done..at]);
+        out.push_str(with);
+        done = at + found.len();
+    }
+    out.push_str(&text[done..]);
+    out
+}
+
 /// A free text (an error of the system, the output of a tool) without anything that names the user or the drive's
 /// content: mount paths and volume labels become `<volume>`, the home folder `<home>`, the user name `<user>`,
-/// UUIDs `<uuid>`; a line about a serial number or the computer's name is dropped.
-pub fn redact(text: &str, disk: &Disk, home: &Path) -> String {
+/// UUIDs `<uuid>`, the computer's name (when given) `<computer>`; a line about a serial number or the computer's name
+/// is dropped.
+pub fn redact(text: &str, disk: &Disk, home: &Path, computer: Option<&str>) -> String {
     let mut out: String = text
         .split('\n')
         .map(|line| {
@@ -240,46 +277,44 @@ pub fn redact(text: &str, disk: &Disk, home: &Path) -> String {
     let mut mounts: Vec<&str> = disk.volumes.iter().map(|v| v.mount.trim_end_matches('\\')).collect();
     mounts.sort_by_key(|m| std::cmp::Reverse(m.len()));
     for mount in mounts.into_iter().filter(|m| m.len() > 1) {
-        out = out.replace(mount, "<volume>");
+        out = if is_drive_letter(mount) { replace_drive(&out, mount, VOLUME) } else { out.replace(mount, VOLUME) };
     }
     let home_text = home.to_string_lossy();
     let home_text = home_text.trim_end_matches(['/', '\\']);
     if home_text.len() > 1 {
-        out = out.replace(home_text, "<home>");
+        out = out.replace(home_text, HOME);
     }
     // any other volume under /Volumes
     while let Some(at) = out.find("/Volumes/") {
         let rest = &out[at + "/Volumes/".len()..];
         let end = rest.find(['/', ':', '\'', '"', '\n']).unwrap_or(rest.len());
-        out.replace_range(at..at + "/Volumes/".len() + end, "<volume>");
+        out.replace_range(at..at + "/Volumes/".len() + end, VOLUME);
     }
     for id in disk.partitions.iter().map(|p| p.id.as_str()).chain([disk.table_id.as_str()]) {
         if !id.is_empty() {
-            out = out.replace(id, "<uuid>");
+            out = out.replace(id, UUID);
         }
     }
-    out = replace_uuids(&out);
+    out = replace_uuids(&out, UUID);
     let mut labels: Vec<&str> = disk.volumes.iter().map(|v| v.label.as_str()).collect();
     labels.sort_by_key(|l| std::cmp::Reverse(l.len()));
     for label in labels.into_iter().filter(|l| !l.trim().is_empty()) {
-        out = replace_word(&out, label, "<volume>");
+        out = replace_word(&out, label, VOLUME);
     }
     if let Some(user) = home.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|u| u.len() > 1) {
-        out = replace_word(&out, &user, "<user>");
+        out = replace_word(&out, &user, USER);
     }
-    out
+    if let Some(computer) = computer.filter(|c| c.len() > 1) {
+        out = replace_word(&out, computer, COMPUTER);
+    }
+    MARKS.iter().fold(out, |out, (mark, name)| out.replace(mark, name))
 }
 
 /// [`redact`], then shortened.
 pub fn free_text(text: &str, disk: &Disk, home: &Path) -> String {
-    let mut out = redact(text.trim(), disk, home);
     // Windows tools print the computer's name
-    if let Ok(computer) = std::env::var("COMPUTERNAME")
-        && computer.len() > 1
-    {
-        out = replace_word(&out, &computer, "<computer>");
-    }
-    out.chars().take(MAX_TEXT).collect()
+    let computer = std::env::var("COMPUTERNAME").ok();
+    redact(text.trim(), disk, home, computer.as_deref()).chars().take(MAX_TEXT).collect()
 }
 
 /// Runs every free text inside a stage's details through [`free_text`].
@@ -689,7 +724,7 @@ mod tests {
     #[test]
     fn redact_replaces_mount_label_and_home() {
         let d = private_disk();
-        let r = |t: &str| redact(t, &d, &home());
+        let r = |t: &str| redact(t, &d, &home(), None);
         assert_eq!(
             r("/Volumes/PHOTOS/UsbMemoryChecker-test/00001.bin: Input/output error"),
             "<volume>/UsbMemoryChecker-test/00001.bin: Input/output error"
@@ -707,8 +742,47 @@ mod tests {
         assert_eq!(r("On computer: DESKTOP-1"), "<removed>");
         // the new volume of a repair is a label too
         let named = with_new_label(&d, "MYSTICK");
-        assert_eq!(redact("Mounted MYSTICK at /Volumes/MYSTICK", &named, &home()), "Mounted <volume> at <volume>");
+        assert_eq!(
+            redact("Mounted MYSTICK at /Volumes/MYSTICK", &named, &home(), None),
+            "Mounted <volume> at <volume>"
+        );
         assert_eq!(free_text(&"x".repeat(1000), &d, &home()).len(), MAX_TEXT);
+    }
+
+    #[test]
+    fn redact_leaves_other_words_and_its_own_placeholders_alone() {
+        let named = |mount: &str, label: &str| {
+            let mut d = private_disk();
+            d.volumes[0] = Volume { mount: mount.into(), label: label.into(), ..d.volumes[0].clone() };
+            d
+        };
+        // Windows: the mount "E:" is not the end of "FILE:"
+        let d = named("E:\\", "");
+        assert_eq!(
+            redact("FILE: E:\\a.bin, (E:) PIPE:x \"E:\"", &d, &home(), None),
+            "FILE: <volume>\\a.bin, (<volume>) PIPE:x \"<volume>\""
+        );
+        // a label that is a word of a placeholder
+        let d = named("/Volumes/volume", "volume");
+        assert_eq!(
+            redact("/Volumes/volume/a: volume busy, /Volumes/OTHER", &d, &home(), None),
+            "<volume>/a: <volume> busy, <volume>"
+        );
+        for label in ["home", "uuid", "user"] {
+            let d = named("/Volumes/x1", label);
+            assert_eq!(
+                redact(
+                    "/Users/somebody/a somebody 11112222-3333-4444-5555-666677778888 /Volumes/x1",
+                    &d,
+                    &home(),
+                    None
+                ),
+                "<home>/a <user> <uuid> <volume>",
+                "{label}"
+            );
+        }
+        let d = named("/Volumes/x1", "computer");
+        assert_eq!(redact("computer at HOST-1", &d, &home(), Some("HOST-1")), "<volume> at <computer>");
     }
 
     #[test]

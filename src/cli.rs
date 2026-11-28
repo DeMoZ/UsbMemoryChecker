@@ -29,27 +29,48 @@ fn mount(d: &disks::Disk) -> Result<PathBuf, String> {
 /// What a command ended with: the JSON or the error text, and the report it left.
 struct Done {
     result: Result<serde_json::Value, String>,
+    /// A quick check whose result cannot be trusted: the JSON is printed all the same, and the command fails.
+    untrusted: Option<String>,
     report: Option<PathBuf>,
+}
+
+impl Done {
+    fn error(&self) -> Option<&str> {
+        match &self.result {
+            Err(e) => Some(e),
+            Ok(_) => self.untrusted.as_deref(),
+        }
+    }
+
+    fn exit_code(&self) -> i32 {
+        i32::from(self.error().is_some())
+    }
+}
+
+/// Why the numbers of a quick check that ran to its end must not be relied on.
+fn untrusted(judged: &crate::Judged) -> Option<String> {
+    let (key, _) = judged.result.as_ref().err()?;
+    Some(match &judged.replug {
+        Some(replug) => format!("the result cannot be trusted ({})", replug.reason),
+        None => format!("the result cannot be trusted ({key})"),
+    })
 }
 
 impl From<Result<serde_json::Value, String>> for Done {
     fn from(result: Result<serde_json::Value, String>) -> Done {
-        Done { result, report: None }
+        Done { result, untrusted: None, report: None }
     }
 }
 
 pub fn main(args: &[String]) -> i32 {
     let done = run(args);
-    let code = match done.result {
-        Ok(v) => {
-            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-            0
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            1
-        }
-    };
+    let code = done.exit_code();
+    if let Ok(v) = &done.result {
+        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+    }
+    if let Some(e) = done.error() {
+        eprintln!("error: {e}");
+    }
     // always the last line on stderr
     if let Some(path) = done.report {
         eprintln!("report: {}", path.display());
@@ -151,7 +172,7 @@ fn full(d: &disks::Disk, args: &[String]) -> Done {
     let rep = report::Report::new(report::Kind::Full, d, started, settings::now())
         .full_data(measured.as_ref(), d, &home)
         .ended(outcome, d, &home);
-    Done { result: result.map_err(|(_, text)| text), report: write_report(rep) }
+    Done { result: result.map_err(|(_, text)| text), untrusted: None, report: write_report(rep) }
 }
 
 fn full_key(e: &fullcheck::Error) -> &'static str {
@@ -177,8 +198,10 @@ fn elevated(d: &disks::Disk, job: &helper::Job) -> Done {
             last = line;
         }
     });
+    let mut not_trusted = None;
     let rep = if job.action == helper::Action::Probe {
         let judged = crate::judge_probe(&ran.result, &ran.log);
+        not_trusted = untrusted(&judged);
         if let Some(replug) = &judged.replug {
             eprintln!(
                 "warning: the result cannot be trusted ({}): unplug the drive, plug it in again and check it again; \
@@ -211,7 +234,7 @@ fn elevated(d: &disks::Disk, job: &helper::Job) -> Done {
         helper::RunError::Declined => "administrator access was not given".to_string(),
         helper::RunError::Failed { message, cause, .. } => failure_text(cause.as_deref(), &message),
     });
-    Done { result, report: write_report(rep) }
+    Done { result, untrusted: not_trusted, report: write_report(rep) }
 }
 
 /// The job of `--cli probe|fix <disk> <real bytes|0> [exfat|fat32] [LABEL]`: no exact partition size and no layout
@@ -249,6 +272,24 @@ mod tests {
     fn cli_error_names_the_cause() {
         assert_eq!(failure_text(Some("privacy"), "Operation not permitted"), "privacy: Operation not permitted");
         assert_eq!(failure_text(None, "the helper stopped without a result"), "the helper stopped without a result");
+    }
+
+    #[test]
+    fn cli_probe_with_an_untrusted_result_fails() {
+        let done = |layout: &str| {
+            let v = json!({"verdict": "genuine", "reported": 10, "real": 10, "points": 1, "badPoints": 0,
+                "seconds": 1.0, "restoreFailures": 0, "restoreCheck": {"checked": 1}, "layoutAfter": layout});
+            let result: Result<serde_json::Value, helper::RunError> = Ok(v.clone());
+            let judged = crate::judge_probe(&result, &[]);
+            Done { result: Ok(v), untrusted: untrusted(&judged), report: None }
+        };
+        let bad = done("changed");
+        assert_eq!(bad.exit_code(), 1);
+        assert_eq!(bad.error(), Some("the result cannot be trusted (layoutChanged)"));
+        assert!(bad.result.is_ok(), "the numbers are still printed");
+        let good = done("same");
+        assert_eq!((good.exit_code(), good.error()), (0, None));
+        assert_eq!(Done::from(Err("boom".to_string())).exit_code(), 1);
     }
 
     #[test]

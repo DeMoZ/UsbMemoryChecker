@@ -97,7 +97,8 @@ struct State {
     capacity: HashMap<String, capacity::Entry>,
     /// What the last quick check of a drive asks the user to do, by `diskN`. In memory only.
     notices: HashMap<String, Notice>,
-    /// The last report written in this run of the program, by `diskN`: the declared size of the drive and the file.
+    /// The last report of a check written in this run of the program, by `diskN`: the declared size of the drive and
+    /// the file.
     reports: HashMap<String, (u64, PathBuf)>,
     /// `capacity.json`: the knowledge of drives that are not connected now.
     store: capacity::Store,
@@ -567,6 +568,8 @@ struct TaskCtx {
     disk: disks::Disk,
     cancel: Arc<AtomicBool>,
     last_progress: Instant,
+    /// What the task asks the user to do with the drive; stored when the task ends ([`end_task`]).
+    notice: Option<Notice>,
 }
 
 impl TaskCtx {
@@ -604,11 +607,22 @@ fn may_start(st: &State, disk: &disks::Disk) -> Result<(), &'static str> {
     }
 }
 
-/// A task of `disk` is about to start: refused while it waits for a re-plug; else the Full Disk Access message of
-/// the drive goes (Ok(true) when there was one).
-fn admit(st: &mut State, disk: &disks::Disk) -> Result<bool, &'static str> {
+/// A task of `disk` is about to start: refused while it waits for a re-plug. When it is a check, the Full Disk
+/// Access message of the drive goes (Ok(true) when there was one); a speed test or a repair leaves it.
+fn admit(st: &mut State, disk: &disks::Disk, kind: &str) -> Result<bool, &'static str> {
     may_start(st, disk)?;
-    Ok(st.notices.remove(&disk.id).is_some())
+    Ok(matches!(kind, "probe" | "full") && st.notices.remove(&disk.id).is_some())
+}
+
+/// Frees the task slot and stores the notice the task left. Both happen under one lock: a scan taken while the task
+/// ran may be applied at any moment of it (a drive that is briefly missing would drop the new notice at once), and
+/// from here on such a scan is stale.
+fn end_task(st: &mut State, disk: &str, notice: Option<Notice>) {
+    st.task = None;
+    if let Some(notice) = notice {
+        st.notices.insert(disk.to_string(), notice);
+    }
+    st.task_gen += 1;
 }
 
 fn start_task<F>(state: &Shared, ui: &Ui, kind: &'static str, disk: Option<String>, work: F)
@@ -628,7 +642,7 @@ where
         ui.error("errNoDisk", json!({}));
         return;
     };
-    let cleared = match admit(&mut st, &disk) {
+    let cleared = match admit(&mut st, &disk, kind) {
         Ok(cleared) => cleared,
         Err(key) => {
             ui.error(key, json!({}));
@@ -654,14 +668,14 @@ where
             disk,
             cancel,
             last_progress: Instant::now() - Duration::from_secs(1),
+            notice: None,
         };
         // a panic in the work (or in a helper thread of it) must not leave the task slot taken for good
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut ctx)))
             .unwrap_or_else(|_| Err(("errIo", json!({"err": "internal error"}))));
         let cancelled = ctx.cancel.load(Ordering::Relaxed);
         let mut st = lock(&state);
-        st.task = None;
-        st.task_gen += 1;
+        end_task(&mut st, &id, ctx.notice.take());
         let msg = match result {
             Ok(v) => json!({"type": "taskDone", "kind": kind, "disk": id, "ok": true, "result": v}),
             Err(_) if cancelled => {
@@ -769,12 +783,14 @@ fn report_full(ctx: &TaskCtx, started: u64, part: Option<report::Report>, result
     save_report(&ctx.state, &ctx.disk, &report::dir(), rep);
 }
 
-/// Writes the report and remembers it for the "Show report" link; a failure changes nothing else.
+/// Writes the report and, for a check, remembers it for the "Show report" link of the Real capacity tab (a repair
+/// report never takes its place); a failure changes nothing else.
 fn save_report(state: &Shared, disk: &disks::Disk, dir: &Path, mut rep: report::Report) {
     match report::write(dir, &mut rep) {
-        Ok(path) => {
+        Ok(path) if rep.kind != report::Kind::Fix.name() => {
             lock(state).reports.insert(disk.id.clone(), (disk.size, path));
         }
+        Ok(_) => {}
         Err(e) => eprintln!("could not write the report: {e}"),
     }
 }
@@ -870,6 +886,7 @@ fn run_probe(ctx: &mut TaskCtx) -> TaskResult {
     let started = settings::now();
     let ran = elevated(ctx, &job);
     let (result, judged) = finish_probe(&ctx.state, &ctx.disk, &ran.result, &ran.log);
+    ctx.notice = judged.notice(ctx.disk.size);
     report_probe(&ctx.state, &ctx.disk, &report::dir(), started, &ran, &judged);
     result
 }
@@ -886,7 +903,7 @@ fn report_probe(state: &Shared, disk: &disks::Disk, dir: &Path, started: u64, ra
 #[derive(Clone, Debug, PartialEq)]
 struct Notice {
     declared: u64,
-    /// macOS blocked the access: the Full Disk Access steps are shown until the next task of the drive.
+    /// macOS blocked the access: the Full Disk Access steps are shown until the next check of the drive.
     fda: bool,
     /// The result cannot be trusted: nothing runs on the drive until it has left the drive list.
     replug: Option<Replug>,
@@ -924,6 +941,11 @@ pub(crate) struct Judged {
 }
 
 impl Judged {
+    /// What the user has to do with the drive of this declared size, if anything.
+    fn notice(&self, declared: u64) -> Option<Notice> {
+        (self.fda || self.replug.is_some()).then(|| Notice { declared, fda: self.fda, replug: self.replug.clone() })
+    }
+
     pub fn outcome_part(&self, helper_result: &Result<Value, helper::RunError>) -> report::OutcomePart {
         let (cause, message) = match helper_result {
             Err(helper::RunError::Failed { cause, message, .. }) => (cause.clone(), Some(message.clone())),
@@ -951,7 +973,7 @@ struct Counts {
 }
 
 /// Why the drive has to be unplugged before anything else, the most telling reason first. `layout`: None when the
-/// helper did not look at the layout.
+/// helper did not look at the layout, or when the run wrote nothing.
 fn replug_reason(
     unresponsive: bool,
     counts: Counts,
@@ -971,7 +993,7 @@ fn replug_reason(
         ("unreadable", check.unreadable as u64)
     } else {
         match layout? {
-            L::Same | L::TableGone => return None,
+            L::Same | L::NotCompared | L::TableGone => return None,
             L::Changed => ("layoutChanged", 0),
             L::DriveGone => ("driveGone", 0),
             L::Unreadable => ("layoutUnknown", 0),
@@ -1017,10 +1039,13 @@ pub(crate) fn judge_probe(r: &Result<Value, helper::RunError>, log: &[String]) -
             let check: probe::RestoreCheck =
                 serde_json::from_value(details["restoreCheck"].clone()).unwrap_or_default();
             let layout: Option<helper::LayoutAfter> = serde_json::from_value(details["layoutAfter"].clone()).ok();
+            // a run that says it wrote nothing did not change the layout, whatever it looks like now (the report
+            // keeps it). The helper's flag, not a count: a count can be 0 after writes
+            let wrote = details["wrote"].as_bool() != Some(false);
             let replug = if details.is_null() {
                 unfinished()
             } else {
-                replug_reason(cause == "unresponsive", counts, &check, layout)
+                replug_reason(cause == "unresponsive", counts, &check, layout.filter(|_| wrote))
             };
             let (key, args) = match cause {
                 "privacy" => ("errFullDiskAccess", json!({})),
@@ -1061,7 +1086,7 @@ pub(crate) fn judge_probe(r: &Result<Value, helper::RunError>, log: &[String]) -
 }
 
 /// The outcome of the quick check: only a trusted one changes the knowledge of the drive. A declined, failed or
-/// untrusted one changes nothing, and may leave a notice for the user.
+/// untrusted one changes nothing, and may leave a notice for the user ([`Judged::notice`]).
 fn finish_probe(
     state: &Shared,
     disk: &disks::Disk,
@@ -1069,10 +1094,6 @@ fn finish_probe(
     log: &[String],
 ) -> (TaskResult, Judged) {
     let judged = judge_probe(r, log);
-    if judged.fda || judged.replug.is_some() {
-        let notice = Notice { declared: disk.size, fda: judged.fda, replug: judged.replug.clone() };
-        lock(state).notices.insert(disk.id.clone(), notice);
-    }
     let outcome = match &judged.result {
         Ok(outcome) => outcome.clone(),
         Err(e) => return (Err(e.clone()), judged),
@@ -1096,7 +1117,7 @@ fn finish_probe(
         io_errors: outcome.io_errors,
         mismatches: outcome.mismatches,
         unsaved: outcome.unsaved,
-        restore_checked: true,
+        restore_checked: outcome.restore_check.checked > 0,
         at: settings::now(),
         ..Default::default()
     };
@@ -1560,8 +1581,20 @@ mod tests {
             "restoreFailures": 0, "restoreCheck": {"checked": 6000}, "flush": "ok", "layoutAfter": "same"})
     }
 
+    /// The end of a quick check as the task does it: the outcome, then the end of the task with its notice.
     fn finish(state: &Shared, disk: &disks::Disk, r: Result<Value, helper::RunError>) -> TaskResult {
-        finish_probe(state, disk, &r, &[]).0
+        finish_logged(state, disk, &r, &[])
+    }
+
+    fn finish_logged(
+        state: &Shared,
+        disk: &disks::Disk,
+        r: &Result<Value, helper::RunError>,
+        log: &[String],
+    ) -> TaskResult {
+        let (result, judged) = finish_probe(state, disk, r, log);
+        end_task(&mut lock(state), &disk.id, judged.notice(disk.size));
+        result
     }
 
     /// An error of the helper with its cause and details.
@@ -1721,11 +1754,11 @@ mod tests {
         let died = || Err(helper::RunError::failed("the helper stopped without a result"));
         // it may have written and nobody checked the restore
         let state = test_state(&disk, None);
-        assert_eq!(finish_probe(&state, &disk, &died(), &[line("baseline")]).0.unwrap_err().0, "errHelper");
+        assert_eq!(finish_logged(&state, &disk, &died(), &[line("baseline")]).unwrap_err().0, "errHelper");
         assert_eq!(notice(&state).unwrap().replug.unwrap().reason, "layoutUnknown");
         // before the baseline nothing was written
         let state = test_state(&disk, None);
-        let _ = finish_probe(&state, &disk, &died(), &[line("found"), line("open")]);
+        let _ = finish_logged(&state, &disk, &died(), &[line("found"), line("open")]);
         assert_eq!(notice(&state), None);
     }
 
@@ -1793,7 +1826,9 @@ mod tests {
         assert_eq!(may_start(&st, &disk), Ok(()));
         st.notices.insert("disk6".into(), replug("unresponsive"));
         assert_eq!(may_start(&st, &disk), Err("errReplugFirst"));
-        assert_eq!(admit(&mut st, &disk), Err("errReplugFirst"));
+        for kind in ["speed", "probe", "full", "fix"] {
+            assert_eq!(admit(&mut st, &disk, kind), Err("errReplugFirst"), "{kind}");
+        }
         assert!(st.notices.contains_key("disk6"), "a refused task leaves the notice");
         // another drive is free, and so is a drive of another size under the same id
         let other = disks::Disk { id: "disk7".into(), ..disk.clone() };
@@ -1831,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn fda_notice_ends_when_the_next_task_starts() {
+    fn fda_notice_ends_when_the_next_check_starts() {
         let disk = test_disk(8_000_000_000);
         let state = test_state(&disk, None);
         let mut st = lock(&state);
@@ -1839,9 +1874,123 @@ mod tests {
         // it stays through scans
         apply_scan(&mut st, 0, vec![disk.clone()], 0, 1);
         assert!(st.notices.contains_key("disk6"));
-        assert_eq!(admit(&mut st, &disk), Ok(true));
+        // a speed test and a repair are no checks
+        for kind in ["speed", "fix"] {
+            assert_eq!(admit(&mut st, &disk, kind), Ok(false), "{kind}");
+            assert!(st.notices.contains_key("disk6"), "{kind}");
+        }
+        for kind in ["probe", "full"] {
+            st.notices.insert("disk6".into(), Notice { declared: DECLARED, fda: true, replug: None });
+            assert_eq!(admit(&mut st, &disk, kind), Ok(true), "{kind}");
+            assert!(st.notices.is_empty(), "{kind}");
+            assert_eq!(admit(&mut st, &disk, kind), Ok(false), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_scan_taken_during_the_task_cannot_drop_the_new_notice() {
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, None);
+        {
+            let mut st = lock(&state);
+            st.task = Some(Task { kind: "probe", disk: disk.id.clone() });
+            st.task_gen = 1;
+        }
+        let details = json!({"counts": {"ioErrors": 1882}, "restoreCheck": {}, "layoutAfter": "tableGone",
+            "wrote": true});
+        let (_, judged) = finish_probe(&state, &disk, &helper_error("unresponsive", details), &[]);
+        let mut st = lock(&state);
+        // a scan that started during the task, with the drive briefly missing, is applied before the task ends
+        assert!(matches!(apply_scan(&mut st, 1, Vec::new(), 0, 1), Applied::Done(..)));
+        end_task(&mut st, &disk.id, judged.notice(disk.size));
+        assert!(st.task.is_none());
+        assert_eq!(st.notices["disk6"].replug.as_ref().map(|r| r.reason), Some("unresponsive"));
+        // the same scan applied after the end of the task is stale
+        assert!(matches!(apply_scan(&mut st, 1, Vec::new(), 0, 2), Applied::Stale));
+        assert!(st.notices.contains_key("disk6"));
+        // a scan taken after the task counts: the drive is listed, then unplugged
+        apply_scan(&mut st, 2, vec![disk.clone()], 0, 3);
+        assert_eq!(may_start(&st, &disk), Err("errReplugFirst"));
+        apply_scan(&mut st, 2, Vec::new(), 0, 4);
         assert!(st.notices.is_empty());
-        assert_eq!(admit(&mut st, &disk), Ok(false));
+    }
+
+    #[test]
+    fn a_failed_run_that_wrote_nothing_asks_for_no_replug_because_of_the_layout() {
+        let disk = test_disk(8_000_000_000);
+        let failed = |cause: &str, wrote: bool, layout: &str| {
+            let details = json!({"counts": {}, "restoreCheck": {}, "layoutAfter": layout, "wrote": wrote});
+            judge_probe(&helper_error(cause, details), &[])
+        };
+        for layout in ["changed", "tableGone", "driveGone", "unreadable"] {
+            // the privacy block on open, a busy drive, a cancel before the first write
+            for cause in ["privacy", "busy", "cancelled", "tooSmall", "other"] {
+                assert_eq!(failed(cause, false, layout).replug, None, "{cause} {layout}");
+                // after a write the same layout does ask for it, whatever the counts say (here all 0)
+                assert!(failed(cause, true, layout).replug.is_some(), "{cause} {layout}");
+            }
+            // "stopped answering" asks for a replug by itself, and the layout does not change its reason
+            assert_eq!(failed("unresponsive", false, layout).replug.map(|r| r.reason), Some("unresponsive"));
+        }
+        // the privacy block still shows its own message
+        let state = test_state(&disk, None);
+        let details = json!({"access": {"cause": "privacy", "op": "open", "errno": 1}, "layoutAfter": "unreadable",
+            "wrote": false});
+        assert_eq!(finish(&state, &disk, helper_error("privacy", details)).unwrap_err().0, "errFullDiskAccess");
+        assert_eq!(notice(&state), Some(Notice { declared: DECLARED, fda: true, replug: None }));
+    }
+
+    #[test]
+    fn an_unreadable_start_layout_leaves_trust_to_the_restore_check() {
+        let disk = disks::Disk { table_unreadable: true, partitions: Vec::new(), ..test_disk(0) };
+        let mut v = probe_json("fake", 5_000_000_000);
+        v["layoutAfter"] = json!("notCompared");
+        let judged = judge_probe(&Ok(v.clone()), &[]);
+        assert!(judged.result.is_ok());
+        assert_eq!(judged.replug, None);
+        let state = test_state(&disk, None);
+        finish(&state, &disk, Ok(v.clone())).unwrap();
+        assert_eq!(notice(&state), None);
+        // the read-back check still decides, and a drive that is gone is not trusted
+        v["restoreCheck"] = json!({"checked": 6000, "mismatched": 1});
+        assert_eq!(judge_probe(&Ok(v.clone()), &[]).replug.map(|r| r.reason), Some("mismatch"));
+        v["restoreCheck"] = json!({"checked": 6000});
+        v["layoutAfter"] = json!("driveGone");
+        assert_eq!(judge_probe(&Ok(v), &[]).replug.map(|r| r.reason), Some("driveGone"));
+    }
+
+    #[test]
+    fn restore_checked_needs_a_block_that_was_read_again() {
+        let disk = test_disk(8_000_000_000);
+        for (checked, expected) in [(0, false), (1, true)] {
+            let state = test_state(&disk, None);
+            let mut v = probe_json("fake", 5_000_000_000);
+            v["restoreCheck"] = json!({"checked": checked});
+            let ok = finish(&state, &disk, Ok(v)).unwrap();
+            assert_eq!(knowledge(&state).last.unwrap().restore_checked, expected, "{checked}");
+            assert_eq!(ok["check"]["restoreChecked"].as_bool().unwrap_or(false), expected, "{checked}");
+        }
+    }
+
+    #[test]
+    fn a_repair_report_is_not_offered_as_the_check_report() {
+        let disk = test_disk(8_000_000_000);
+        let state = test_state(&disk, None);
+        let logs = std::env::temp_dir().join(format!("umc_main_fix_report_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&logs);
+        let of = |kind| report::Report::new(kind, &disk, 1, 2);
+        // a repair alone gives the Real capacity tab nothing to show
+        save_report(&state, &disk, &logs, of(report::Kind::Fix));
+        assert_eq!(report_to_reveal(&lock(&state), Some("disk6")), None);
+        for kind in [report::Kind::Probe, report::Kind::Full] {
+            save_report(&state, &disk, &logs, of(kind));
+            let check = report_to_reveal(&lock(&state), Some("disk6")).unwrap();
+            assert!(check.to_string_lossy().contains(kind.name()), "{check:?}");
+            save_report(&state, &disk, &logs, of(report::Kind::Fix));
+            assert_eq!(report_to_reveal(&lock(&state), Some("disk6")), Some(check));
+        }
+        assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 5, "every report is written");
+        std::fs::remove_dir_all(&logs).unwrap();
     }
 
     #[test]

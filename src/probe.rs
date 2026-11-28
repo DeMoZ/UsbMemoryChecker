@@ -322,6 +322,8 @@ pub struct ProbeRun {
     pub stats: Stats,
     pub restore_check: RestoreCheck,
     pub flush: FlushResult,
+    /// A write to the device was attempted. False: the drive is as it was.
+    pub wrote: bool,
 }
 
 /// Progress: overall fraction 0..1 and the stage key for the window (`prCoarse`, `prRefine`, `prRestore`).
@@ -876,6 +878,7 @@ pub fn probe(
             stats: Stats::default(),
             restore_check: RestoreCheck::default(),
             flush: FlushResult::default(),
+            wrote: false,
         };
     }
     let mut run = Run {
@@ -896,8 +899,10 @@ pub fn probe(
     let Run { dev, mut undo, progress, events, mut stats, baseline, no_baseline, .. } = run;
     let mut restore_check = RestoreCheck::default();
     let mut flush = FlushResult::default();
+    // an entry is kept before every write, so no entry means that no write was attempted
+    let wrote = !undo.entries.is_empty();
     // without a write there is nothing to put back and nothing to check
-    if !undo.entries.is_empty() {
+    if wrote {
         let not_reread: BTreeSet<u64> = undo
             .entries
             .iter()
@@ -932,7 +937,7 @@ pub fn probe(
         restore_check: restore_check.clone(),
         flush: flush.clone(),
     });
-    ProbeRun { result, stats, restore_check, flush }
+    ProbeRun { result, stats, restore_check, flush, wrote }
 }
 
 #[cfg(test)]
@@ -1295,6 +1300,7 @@ mod tests {
         let r = raw(&mut sim);
         assert!(unresponsive(&r));
         assert_eq!(sim.writes, 0);
+        assert!(!r.wrote);
         assert_eq!(r.restore_check, RestoreCheck::default());
         assert!(r.stats.failures.iter().any(|f| f.offset == 8 * MIB && f.op == Op::Baseline));
     }
@@ -1335,6 +1341,7 @@ mod tests {
         sim.fail_after = Some(half);
         let r = raw(&mut sim);
         assert!(unresponsive(&r), "{:?}", r.result);
+        assert!(r.wrote);
         assert!(r.stats.restore_failures > 100, "{}", r.stats.restore_failures);
         assert!(!r.restore_check.confirmed());
         assert!(r.stats.unsaved > 0 && r.stats.io_errors > 0);

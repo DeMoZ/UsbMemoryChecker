@@ -107,7 +107,9 @@ fails with an error), the check ends without a verdict. "The drive keeps no data
 back different while the start of the drive still answers.
 
 **When to unplug.** If the drive stopped answering, a block could not be written back or reads back different, or the
-partition layout changed or vanished, the result is not saved. The window asks you to unplug the drive, plug it in
+partition layout changed or vanished, the result is not saved. (If the partition table could not be read even before
+the check, there is nothing to compare it with, and the read-back alone decides. A check that wrote nothing does not
+ask you to unplug because of the layout.) The window asks you to unplug the drive, plug it in
 again and check it again, and until the drive has left the list the app starts nothing on it. **Do not format,
 initialize or repair it first, even if the system offers to.**
 
@@ -119,7 +121,7 @@ the drive starts losing data; after an early stop only the written part is check
 
 Every quick check, full check and repair leaves a small JSON report, also when it failed or was cancelled:
 `~/Library/Logs/UsbMemoryChecker/checks/` on macOS, `%LOCALAPPDATA%\UsbMemoryChecker\logs\checks\` on Windows.
-**Show report** on the **Real capacity** tab opens the folder at the last report of the selected drive; the command
+**Show report** on the **Real capacity** tab opens the folder at the last check report of the selected drive; the command
 line prints its path. A report holds the stages, error codes and positions, counts, the read-back and layout checks,
 the drive's model, size and partition offsets, sizes and file systems. It never holds your files or data read from
 the drive (or digests of it), volume names, mount paths, volume UUIDs, disk identifiers, serial numbers, your user

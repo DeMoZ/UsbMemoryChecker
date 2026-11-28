@@ -57,8 +57,10 @@ a running `UsbMemoryChecker.app` instance. Leave no background processes (`pgrep
   additions: `fail_after: Option<usize>` (every operation after the Nth returns `io::Error::other("I/O error")`),
   `fail_writes_at: Box<dyn Fn(u64) -> bool>`, an operation counter. Tests: `drive_that_fails_everything_is_not_broken`
   (every read and write fails → `Unresponsive`, writes attempted = 0), `drive_that_stops_mid_round`
-  (`fail_after` = half of the coarse round's operations → `Unresponsive`, never Fake / Broken; `intact()` for the
-  cells written before the failure), `one_transient_error_on_the_first_point` (only the write at the first point
+  (`fail_after` = half of the coarse round's operations, never Fake / Broken, two cases: (1) the drive never answers
+  again → `Unresponsive`, the write-back is tried for every written block and its failures are counted, the restore
+  is not confirmed; (2) `heals_after`: it answers again after the run gave up → `Unresponsive`, `intact()`, no
+  restore failure, the restore is confirmed), `one_transient_error_on_the_first_point` (only the write at the first point
   fails → `Unresponsive`), `drive_that_keeps_nothing` (unchanged expectation: Broken, now also `mismatches > 0`,
   `io_errors == 0`), `read_errors_count_as_lost_data` (still Fake, now `io_errors > 0`), `lost_writes_read_as_ff`
   (`mismatches > 0`, `io_errors == 0`), `decide_table` (every combination of first class × liveness).
@@ -165,10 +167,11 @@ a running `UsbMemoryChecker.app` instance. Leave no background processes (`pgrep
 - [x] 7.1 Notices (design D6): `State.notices: HashMap<String, Notice>` and `State.reports: HashMap<String,
   (u64 declared, PathBuf)>`. `send_disks` adds `"notices": {diskN: {kind, reason, counts}}` and `"reports": {diskN:
   true}`. `apply_scan` drops a `Replug` notice when a successful scan has no drive with that id and declared size
-  (failed scans never reach it). `start_task` drops a `FullDiskAccess` notice of that drive when its task starts, and
+  (failed scans never reach it). `start_task` drops a `FullDiskAccess` notice of that drive when a check (quick or
+  full) of it starts, and
   refuses any task on a drive with a `Replug` notice with `ui.error("errReplugFirst")`. Tests: `replug_notice_blocks_tasks`
   (start_task is factored so the refusal is a pure check `fn may_start(st, disk) -> Result<(), &str>`),
-  `replug_notice_survives_a_failed_scan_and_ends_on_a_good_one`, `fda_notice_ends_when_the_next_task_starts`.
+  `replug_notice_survives_a_failed_scan_and_ends_on_a_good_one`, `fda_notice_ends_when_the_next_check_starts`.
 - [x] 7.2 `finish_probe` (design D6, D8): keep the key for each cause (`errFullDiskAccess`, `errAccessBusy`,
   `errAccessReadOnly`, `errDriveGone`, `errAccess{err}`, `errUnresponsive{io, mismatches}`). A successful run is
   trusted only when `restore_failures == 0`, `restore_check` has no mismatched or unreadable block and `layoutAfter ==
@@ -264,6 +267,23 @@ a running `UsbMemoryChecker.app` instance. Leave no background processes (`pgrep
   errno differs, record it and adjust task 1.1.
 - [ ] 12.4 For Roman: press "Open Full Disk Access settings" on macOS 27 and confirm that System Settings opens at
   Privacy & Security → Full Disk Access (or at least System Settings, through the fallback).
+
+## 13. Review fixes, round 1
+
+- [x] 13.1 `ProbeRun.wrote` / `details.wrote`: a failed run that wrote nothing asks for no replug because of the layout.
+  Test `a_failed_run_that_wrote_nothing_asks_for_no_replug_because_of_the_layout`.
+- [x] 13.2 `LayoutAfter::NotCompared` when the table could not be read before the check. Tests
+  `an_unreadable_start_layout_is_not_compared`, `an_unreadable_start_layout_leaves_trust_to_the_restore_check`.
+- [x] 13.3 The notice is stored by `end_task`, under the lock that ends the task. Test
+  `a_scan_taken_during_the_task_cannot_drop_the_new_notice`.
+- [x] 13.4 `JobFolder`: the helper opens the job folder once and uses that handle for every file. Test
+  `a_job_folder_swapped_for_a_link_later_gets_no_writes`.
+- [x] 13.5 The Full Disk Access notice lasts until the next check; "Show report" opens a check report;
+  `restoreChecked` needs `checked > 0`; an untrusted `--cli probe` exits non-zero. Tests
+  `fda_notice_ends_when_the_next_check_starts`, `a_repair_report_is_not_offered_as_the_check_report`,
+  `restore_checked_needs_a_block_that_was_read_again`, `cli_probe_with_an_untrusted_result_fails`.
+- [x] 13.6 Redaction leaves other words and its own placeholders alone. Test
+  `redact_leaves_other_words_and_its_own_placeholders_alone`.
 
 ## Workflow follow-up
 

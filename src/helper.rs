@@ -11,7 +11,8 @@
 //!
 //! The helper also appends one JSON line per stage to `log.jsonl` (the window makes the report from it, as the
 //! user). It runs as root in a folder the user owns, so it never writes through a link: it refuses a job folder
-//! that is a link, and every file it writes there is a new file that is not a link. After a quick check it closes
+//! that is a link, opens the folder once and reaches every file through that handle ([`JobFolder`]), and every file
+//! it writes there is a new file that is not a link. After a quick check it closes
 //! the device, remounts and compares the partition layout with the one from before ([`LayoutAfter`]).
 
 use std::fs::{File, OpenOptions};
@@ -124,32 +125,204 @@ pub fn fix_size(job: &Job) -> Result<u64, String> {
 
 // ------------------------------------------------------------------ the helper side (elevated)
 
-/// Creates a new file that is not a link: an existing file or a link in its place is an error, never followed.
-pub fn create_new_nofollow(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+/// The job folder as the helper uses it: opened once, and every file is then reached through that one handle. The
+/// user owns the folder and the helper runs as root, so the folder's path is never followed again: swapping it for a
+/// link later changes nothing.
+///
+/// Unix: a directory descriptor (`O_DIRECTORY | O_NOFOLLOW`) with `openat` / `renameat` / `unlinkat`.
+/// Windows has no such calls here: the folder is held open without delete sharing, so it cannot be renamed or
+/// removed, and the event log stays open inside it (also without delete sharing), so the folder is never empty and
+/// cannot be turned into a junction ([`JobFolder::create_log`] checks that the log really is inside it).
+pub struct JobFolder {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
+    dir: File,
+    #[cfg(not(unix))]
+    path: PathBuf,
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(path)
+    pin: File,
 }
 
-/// Replaces `path` with the JSON: a new temporary file (an old one is removed, which removes a link and not its
-/// target), then a rename.
-fn write_json(path: &Path, v: &Value) {
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let written = create_new_nofollow(&tmp).and_then(|mut f| f.write_all(v.to_string().as_bytes()));
-    if written.is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+#[cfg(unix)]
+impl JobFolder {
+    /// An error when `path` is not a real folder (a link to one included).
+    pub fn open(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)?;
+        Ok(JobFolder { dir })
+    }
+
+    fn name(name: &str) -> io::Result<std::ffi::CString> {
+        std::ffi::CString::new(name).map_err(io::Error::other)
+    }
+
+    /// A file of the folder; a link in its place is an error, never followed.
+    fn open_at(&self, name: &str, flags: libc::c_int) -> io::Result<File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = Self::name(name)?;
+        let flags = flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mode: libc::c_uint = 0o666;
+        // SAFETY: the descriptor of the folder is open and the name is a C string.
+        let fd = unsafe { libc::openat(self.dir.as_raw_fd(), name.as_ptr(), flags, mode) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a new descriptor that nothing else owns.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// A new file; an existing file or a link in its place is an error.
+    fn create_new(&self, name: &str) -> io::Result<File> {
+        self.open_at(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)
+    }
+
+    fn create_log(&self) -> io::Result<File> {
+        self.create_new("log.jsonl")
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        io::Read::read_to_end(&mut self.open_at(name, libc::O_RDONLY | libc::O_NONBLOCK)?, &mut data)?;
+        Ok(data)
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        self.open_at(name, libc::O_RDONLY | libc::O_NONBLOCK).is_ok()
+    }
+
+    /// Removes the entry (a link itself, never its target).
+    fn remove(&self, name: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let name = Self::name(name)?;
+        // SAFETY: as in `open_at`.
+        match unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let (from, to) = (Self::name(from)?, Self::name(to)?);
+        let fd = self.dir.as_raw_fd();
+        // SAFETY: as in `open_at`.
+        match unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE`: others may read and write, nobody may rename or delete.
+#[cfg(windows)]
+const SHARE_NO_DELETE: u32 = 0x1 | 0x2;
+
+/// The path of an open file or folder as the system resolved it.
+#[cfg(windows)]
+fn final_path(file: &File) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = vec![0u16; 32_768];
+    // SAFETY: the handle is open and the buffer has the length given.
+    let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, 0) };
+    if n == 0 || n as usize >= buf.len() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize])))
+}
+
+#[cfg(not(unix))]
+impl JobFolder {
+    /// An error when `path` is not a real folder (a link or a junction to one included).
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let not_a_folder = || io::Error::other("not a folder");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            let pin = OpenOptions::new()
+                .read(true)
+                .share_mode(SHARE_NO_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            let attributes = pin.metadata()?.file_attributes();
+            if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(not_a_folder());
+            }
+            Ok(JobFolder { path: path.to_path_buf(), pin })
+        }
+        #[cfg(not(windows))]
+        {
+            if !std::fs::symlink_metadata(path)?.is_dir() {
+                return Err(not_a_folder());
+            }
+            Ok(JobFolder { path: path.to_path_buf() })
+        }
+    }
+
+    fn options() -> OpenOptions {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        options
+    }
+
+    /// A new file; an existing file or a link in its place is an error.
+    fn create_new(&self, name: &str) -> io::Result<File> {
+        Self::options().open(self.path.join(name))
+    }
+
+    /// The event log. On Windows it also pins the folder for as long as it is open.
+    fn create_log(&self) -> io::Result<File> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let log = Self::options().share_mode(SHARE_NO_DELETE).open(self.path.join("log.jsonl"))?;
+            if final_path(&log)?.parent() != Some(final_path(&self.pin)?.as_path()) {
+                return Err(io::Error::other("the job folder was replaced"));
+            }
+            Ok(log)
+        }
+        #[cfg(not(windows))]
+        self.create_new("log.jsonl")
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        std::fs::read(self.path.join(name))
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        self.path.join(name).exists()
+    }
+
+    /// Removes the entry (a link itself, never its target).
+    fn remove(&self, name: &str) -> io::Result<()> {
+        std::fs::remove_file(self.path.join(name))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        std::fs::rename(self.path.join(from), self.path.join(to))
+    }
+}
+
+impl JobFolder {
+    /// Replaces the file `name` with the JSON: a new temporary file (an old one is removed, which removes a link and
+    /// not its target), then a rename.
+    fn write_json(&self, name: &str, v: &Value) {
+        let tmp = Path::new(name).with_extension("tmp").to_string_lossy().into_owned();
+        let _ = self.remove(&tmp);
+        let written = self.create_new(&tmp).and_then(|mut f| f.write_all(v.to_string().as_bytes()));
+        if written.is_ok() {
+            let _ = self.rename(&tmp, name);
+        }
     }
 }
 
@@ -160,8 +333,8 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    pub fn create(dir: &Path) -> io::Result<Self> {
-        Ok(EventLog { file: create_new_nofollow(&dir.join("log.jsonl"))? })
+    pub fn create(folder: &JobFolder) -> io::Result<Self> {
+        Ok(EventLog { file: folder.create_log()? })
     }
 
     pub fn event(&mut self, stage: &str, ok: bool, info: Value) {
@@ -209,17 +382,23 @@ fn cause_name(cause: dio::AccessCause) -> String {
 /// Entry of `--helper <folder>`; returns the process exit code.
 pub fn main(dir: &Path) -> i32 {
     // a job folder that is not a real folder (a link, say) gets nothing written into it
-    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+    let Ok(folder) = JobFolder::open(dir) else {
         eprintln!("the job folder is not safe");
         return 1;
-    }
+    };
     disks::set_elevated();
-    let result = match EventLog::create(dir) {
-        Ok(mut log) => std::fs::read(dir.join("job.json"))
+    let result = match EventLog::create(&folder) {
+        Ok(mut log) => folder
+            .read("job.json")
             .map_err(|e| format!("could not read the job: {e}"))
             .and_then(|d| serde_json::from_slice::<Job>(&d).map_err(|e| format!("bad job: {e}")))
             .map_err(JobError::from)
-            .and_then(|job| run_job(&job, dir, &mut log)),
+            .and_then(|job| run_job(&job, &folder, &mut log)),
+        // without the log the folder is not pinned on Windows, so nothing more is written there
+        Err(e) if cfg!(windows) => {
+            eprintln!("the job folder is not safe: {e}");
+            return 1;
+        }
         Err(e) => Err(JobError::new("other", format!("the job folder is not safe: {e}"))),
     };
     let ok = result.is_ok();
@@ -227,7 +406,7 @@ pub fn main(dir: &Path) -> i32 {
         Ok(v) => json!({"ok": true, "result": v}),
         Err(e) => e.to_json(),
     };
-    write_json(&dir.join("result.json"), &v);
+    folder.write_json("result.json", &v);
     if ok { 0 } else { 1 }
 }
 
@@ -248,7 +427,7 @@ fn found_info(disk: &Disk) -> Value {
     json!({"volumesMounted": disk.volumes.len(), "partitions": report::partitions_of(disk)})
 }
 
-fn run_job(job: &Job, dir: &Path, log: &mut EventLog) -> Result<Value, JobError> {
+fn run_job(job: &Job, folder: &JobFolder, log: &mut EventLog) -> Result<Value, JobError> {
     if !disks::valid_id(&job.disk) {
         return Err(format!("bad drive id {:?}", job.disk).into());
     }
@@ -265,23 +444,21 @@ fn run_job(job: &Job, dir: &Path, log: &mut EventLog) -> Result<Value, JobError>
     if job.action == Action::Fix && disk.table_unreadable {
         return Err("the partition table of the drive could not be read; look at the drive again".to_string().into());
     }
-    let cancel_file = dir.join("cancel");
-    let progress_file = dir.join("progress.json");
     let cancel = AtomicBool::new(false);
     let mut last = Instant::now() - Duration::from_secs(1);
     let mut progress = |fraction: f64, stage: &'static str| {
         if last.elapsed() >= Duration::from_millis(200) || fraction >= 1.0 {
             last = Instant::now();
-            if cancel_file.exists() {
+            if folder.exists("cancel") {
                 cancel.store(true, Ordering::Relaxed);
             }
-            write_json(&progress_file, &json!({"fraction": fraction, "stage": stage}));
+            folder.write_json("progress.json", &json!({"fraction": fraction, "stage": stage}));
         }
     };
     match job.action {
         Action::Probe => {
-            let expected = job.layout.clone().unwrap_or_else(|| Fingerprint::of(&disk));
-            run_probe(&disk, &expected, &cancel, &mut progress, log)
+            let expected = expected_layout(job, &disk);
+            run_probe(&disk, expected.as_ref(), &cancel, &mut progress, log)
         }
         Action::Fix => {
             progress(0.05, "prFixing");
@@ -304,30 +481,51 @@ pub enum LayoutAfter {
     DriveGone,
     /// The list of drives did not answer, or the partition table could not be read.
     Unreadable,
+    /// The drive is there, but its table could not be read before the check: there is nothing to compare with. The
+    /// layout neither passes nor fails; the read-back check alone says whether the result is trusted.
+    NotCompared,
 }
 
-pub fn layout_after(expected: &Fingerprint, found: Result<Disk, String>) -> LayoutAfter {
-    match found {
-        Ok(d) if d.table_unreadable => LayoutAfter::Unreadable,
-        Ok(d) if &Fingerprint::of(&d) == expected => LayoutAfter::Same,
-        Ok(d) if d.partitions.is_empty() && !expected.partitions.is_empty() => LayoutAfter::TableGone,
-        Ok(_) => LayoutAfter::Changed,
-        // the messages of `disks::find`
-        Err(e) if e.contains("is not connected") || e.contains("changed (size") => LayoutAfter::DriveGone,
-        Err(_) => LayoutAfter::Unreadable,
+impl LayoutAfter {
+    /// Nothing to wait for any more.
+    fn settled(self) -> bool {
+        matches!(self, LayoutAfter::Same | LayoutAfter::NotCompared)
     }
 }
 
-/// Looks the drive up once a second for up to 10 s, until it lists with the expected layout again.
+/// The layout the drive should have after the check: the job's, else the one found at the start. None: the table
+/// could not be read at the start, so there is nothing to compare with.
+fn expected_layout(job: &Job, disk: &Disk) -> Option<Fingerprint> {
+    (!disk.table_unreadable).then(|| job.layout.clone().unwrap_or_else(|| Fingerprint::of(disk)))
+}
+
+pub fn layout_after(expected: Option<&Fingerprint>, found: Result<Disk, String>) -> LayoutAfter {
+    let found = match found {
+        Ok(found) => found,
+        // the messages of `disks::find`
+        Err(e) if e.contains("is not connected") || e.contains("changed (size") => return LayoutAfter::DriveGone,
+        Err(_) => return LayoutAfter::Unreadable,
+    };
+    match expected {
+        None => LayoutAfter::NotCompared,
+        Some(_) if found.table_unreadable => LayoutAfter::Unreadable,
+        Some(expected) if &Fingerprint::of(&found) == expected => LayoutAfter::Same,
+        Some(expected) if found.partitions.is_empty() && !expected.partitions.is_empty() => LayoutAfter::TableGone,
+        Some(_) => LayoutAfter::Changed,
+    }
+}
+
+/// Looks the drive up once a second for up to 10 s, until it lists with the expected layout again (or just lists,
+/// when there is nothing to compare with).
 #[cfg(any(target_os = "macos", windows))]
-fn check_layout_after(disk: &Disk, expected: &Fingerprint, log: &mut EventLog) -> LayoutAfter {
+fn check_layout_after(disk: &Disk, expected: Option<&Fingerprint>, log: &mut EventLog) -> LayoutAfter {
     let start = Instant::now();
     loop {
         let found = disks::find(&disk.id, disk.size);
         let seen = found.as_ref().ok().map(report::layout_summary);
         let after = layout_after(expected, found);
-        if after == LayoutAfter::Same || start.elapsed() >= Duration::from_secs(10) {
-            log.event("layout", after == LayoutAfter::Same, json!({"result": after, "layout": seen}));
+        if after.settled() || start.elapsed() >= Duration::from_secs(10) {
+            log.event("layout", after.settled(), json!({"result": after, "layout": seen}));
             return after;
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -342,7 +540,7 @@ fn counts(stats: &probe::Stats) -> Value {
 /// The result of a probe run with the layout check that followed it.
 fn probe_result(run: probe::ProbeRun, layout: LayoutAfter) -> Result<Value, JobError> {
     let mut details = json!({"counts": counts(&run.stats), "restoreCheck": run.restore_check, "flush": run.flush,
-        "layoutAfter": layout});
+        "layoutAfter": layout, "wrote": run.wrote});
     let (cause, message) = match run.result {
         Ok(o) => {
             let mut v = serde_json::to_value(o).map_err(|e| JobError::from(e.to_string()))?;
@@ -367,12 +565,12 @@ fn open_error(device: &str, e: &io::Error) -> JobError {
         Some(a) => JobError {
             message,
             cause: cause_name(a.cause),
-            details: json!({"access": {"cause": a.cause, "op": a.op, "errno": a.errno}}),
+            details: json!({"access": {"cause": a.cause, "op": a.op, "errno": a.errno}, "wrote": false}),
         },
         None => JobError {
             message,
             cause: "other".into(),
-            details: json!({"access": {"op": probe::Op::Open, "errno": e.raw_os_error()}}),
+            details: json!({"access": {"op": probe::Op::Open, "errno": e.raw_os_error()}, "wrote": false}),
         },
     }
 }
@@ -412,7 +610,7 @@ fn probe_device(
 #[cfg(any(target_os = "macos", windows))]
 fn after_probe(
     disk: &Disk,
-    expected: &Fingerprint,
+    expected: Option<&Fingerprint>,
     probed: Result<probe::ProbeRun, JobError>,
     log: &mut EventLog,
 ) -> Result<Value, JobError> {
@@ -466,7 +664,7 @@ fn diskutil(args: &[&str]) -> Result<String, String> {
 #[cfg(target_os = "macos")]
 fn run_probe(
     disk: &Disk,
-    expected: &Fingerprint,
+    expected: Option<&Fingerprint>,
     cancel: &AtomicBool,
     progress: &mut probe::Progress,
     log: &mut EventLog,
@@ -493,7 +691,7 @@ fn run_probe(
 #[cfg(windows)]
 fn run_probe(
     disk: &Disk,
-    expected: &Fingerprint,
+    expected: Option<&Fingerprint>,
     cancel: &AtomicBool,
     progress: &mut probe::Progress,
     log: &mut EventLog,
@@ -512,7 +710,7 @@ fn run_probe(
 #[cfg(not(any(target_os = "macos", windows)))]
 fn run_probe(
     _: &Disk,
-    _: &Fingerprint,
+    _: Option<&Fingerprint>,
     _: &AtomicBool,
     _: &mut probe::Progress,
     _: &mut EventLog,
@@ -999,11 +1197,45 @@ mod tests {
         let target = t.0.join("target.txt");
         std::fs::write(&target, "keep me").unwrap();
         std::os::unix::fs::symlink(&target, t.0.join("progress.tmp")).unwrap();
-        write_json(&t.0.join("progress.json"), &json!({"fraction": 0.5}));
+        JobFolder::open(&t.0).unwrap().write_json("progress.json", &json!({"fraction": 0.5}));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
         let written = t.0.join("progress.json");
         assert!(std::fs::symlink_metadata(&written).unwrap().is_file());
         assert_eq!(std::fs::read_to_string(written).unwrap(), json!({"fraction": 0.5}).to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_folder_swapped_for_a_link_later_gets_no_writes() {
+        let t = Temp::new("swapped");
+        let (job, moved, victim) = (t.0.join("job"), t.0.join("moved"), t.0.join("victim"));
+        std::fs::create_dir(&job).unwrap();
+        std::fs::write(job.join("job.json"), "mine").unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        let names = ["job.json", "progress.json", "progress.tmp", "result.json", "result.tmp", "cancel"];
+        for name in names {
+            std::fs::write(victim.join(name), "keep me").unwrap();
+        }
+        let folder = JobFolder::open(&job).unwrap();
+        // the user's process swaps the folder for a link after the helper has opened it
+        std::fs::rename(&job, &moved).unwrap();
+        std::os::unix::fs::symlink(&victim, &job).unwrap();
+        let mut log = EventLog::create(&folder).unwrap();
+        log.event("found", true, json!({}));
+        folder.write_json("progress.json", &json!({"fraction": 0.5}));
+        folder.write_json("result.json", &json!({"ok": true}));
+        assert_eq!(folder.read("job.json").unwrap(), b"mine");
+        assert!(!folder.exists("cancel"), "the other folder's file is not seen");
+        // nothing in the link's target was created, removed or changed
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), names.len());
+        for name in names {
+            assert_eq!(std::fs::read_to_string(victim.join(name)).unwrap(), "keep me", "{name}");
+        }
+        // everything went into the folder that was opened
+        assert_eq!(read_log(&moved).len(), 1);
+        for name in ["progress.json", "result.json"] {
+            assert!(moved.join(name).is_file(), "{name}");
+        }
     }
 
     #[cfg(unix)]
@@ -1037,7 +1269,7 @@ mod tests {
     fn log_refuses_an_existing_file() {
         let t = Temp::new("log_exists");
         std::fs::write(t.0.join("log.jsonl"), "old").unwrap();
-        assert!(EventLog::create(&t.0).is_err());
+        assert!(EventLog::create(&JobFolder::open(&t.0).unwrap()).is_err());
         assert_eq!(std::fs::read_to_string(t.0.join("log.jsonl")).unwrap(), "old");
         #[cfg(unix)]
         {
@@ -1045,7 +1277,7 @@ mod tests {
             std::fs::write(&target, "keep me").unwrap();
             std::fs::remove_file(t.0.join("log.jsonl")).unwrap();
             std::os::unix::fs::symlink(&target, t.0.join("log.jsonl")).unwrap();
-            assert!(EventLog::create(&t.0).is_err());
+            assert!(EventLog::create(&JobFolder::open(&t.0).unwrap()).is_err());
             // the whole job fails with an error, and the target of the link stays as it was
             assert_eq!(main(&t.0), 1);
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
@@ -1058,7 +1290,7 @@ mod tests {
     #[test]
     fn log_lines_are_json() {
         let t = Temp::new("log_lines");
-        let mut log = EventLog::create(&t.0).unwrap();
+        let mut log = EventLog::create(&JobFolder::open(&t.0).unwrap()).unwrap();
         log.event("found", true, json!({"volumesMounted": 1}));
         log.event("open", false, json!({"op": "open", "errno": 1}));
         log.event("layout", true, json!({"result": "same"}));
@@ -1077,6 +1309,7 @@ mod tests {
             stats: probe::Stats { io_errors: 1882, mismatches: 3, unsaved: 5, ..Default::default() },
             restore_check: Default::default(),
             flush: probe::FlushResult::Unsupported,
+            wrote: true,
         }
     }
 
@@ -1105,6 +1338,7 @@ mod tests {
             assert_eq!(v["details"]["counts"]["mismatches"], 3);
             assert_eq!(v["details"]["layoutAfter"], "tableGone");
             assert_eq!(v["details"]["flush"], "unsupported");
+            assert_eq!(v["details"]["wrote"], true);
             assert_eq!(v["details"]["restoreCheck"]["mismatched"], 0);
         }
         for cause in ["privacy", "busy", "readOnly", "gone", "denied"] {
@@ -1120,9 +1354,12 @@ mod tests {
                 (e.details["access"]["op"].as_str(), e.details["access"]["errno"].as_i64()),
                 (Some("open"), Some(1))
             );
+            assert_eq!(e.details["wrote"], false);
             assert_eq!(open_error("/dev/rdisk9", &io::Error::from_raw_os_error(libc::EBUSY)).cause, "busy");
             assert_eq!(open_error("/dev/rdisk9", &io::Error::from_raw_os_error(libc::ENOENT)).cause, "other");
         }
+        let unwritten = probe::ProbeRun { wrote: false, ..run_of(Err(probe::Abort::Cancelled)) };
+        assert_eq!(probe_result(unwritten, LayoutAfter::Changed).unwrap_err().details["wrote"], false);
         // a verdict carries the layout check
         let outcome: probe::Outcome = serde_json::from_value(json!({"verdict": "genuine", "reported": 10, "real": 10,
             "points": 1, "badPoints": 0, "seconds": 1.0, "restoreFailures": 0}))
@@ -1136,8 +1373,8 @@ mod tests {
     fn run_in_reads_cause_and_details() {
         let t = Temp::new("result");
         let path = t.0.join("result.json");
-        write_json(
-            &path,
+        JobFolder::open(&t.0).unwrap().write_json(
+            "result.json",
             &json!({"ok": false, "error": "the drive stopped answering", "cause": "unresponsive",
                 "details": {"counts": {"ioErrors": 1882}, "layoutAfter": "tableGone"}}),
         );
@@ -1173,7 +1410,7 @@ mod tests {
     fn layout_after_cases() {
         let one = disks::Partition { offset: MIB, size: 8_303_673_344, id: "U".into() };
         let expected = Fingerprint::of(&listed(vec![one.clone()]));
-        let after = |found| layout_after(&expected, found);
+        let after = |found| layout_after(Some(&expected), found);
         assert_eq!(after(Ok(listed(vec![one.clone()]))), LayoutAfter::Same);
         let other = disks::Partition { size: 1 << 30, ..one.clone() };
         assert_eq!(after(Ok(listed(vec![other]))), LayoutAfter::Changed);
@@ -1189,7 +1426,27 @@ mod tests {
         assert_eq!(after(Ok(unreadable)), LayoutAfter::Unreadable);
         // a blank drive that stays blank is the same
         let blank = Fingerprint::of(&listed(Vec::new()));
-        assert_eq!(layout_after(&blank, Ok(listed(Vec::new()))), LayoutAfter::Same);
+        assert_eq!(layout_after(Some(&blank), Ok(listed(Vec::new()))), LayoutAfter::Same);
+    }
+
+    #[test]
+    fn an_unreadable_start_layout_is_not_compared() {
+        let one = disks::Partition { offset: MIB, size: 8_303_673_344, id: "U".into() };
+        let unreadable = Disk { table_unreadable: true, ..listed(Vec::new()) };
+        let job = Job { action: Action::Probe, layout: Some(Fingerprint::of(&unreadable)), ..job(0, Fs::Exfat) };
+        assert_eq!(expected_layout(&job, &unreadable), None);
+        let readable = listed(vec![one.clone()]);
+        assert_eq!(expected_layout(&Job { layout: None, ..job.clone() }, &readable), Some(Fingerprint::of(&readable)));
+        // whatever the drive lists afterwards, the layout neither passes nor fails
+        for found in [unreadable, listed(Vec::new()), readable] {
+            let after = layout_after(None, Ok(found));
+            assert_eq!(after, LayoutAfter::NotCompared);
+            assert!(after.settled());
+        }
+        assert_eq!(serde_json::to_value(LayoutAfter::NotCompared).unwrap(), "notCompared");
+        // a drive that is gone, or a list that does not answer, is still a failure
+        assert_eq!(layout_after(None, Err("drive disk6 is not connected".into())), LayoutAfter::DriveGone);
+        assert_eq!(layout_after(None, Err("diskutil did not answer".into())), LayoutAfter::Unreadable);
     }
 
     #[test]

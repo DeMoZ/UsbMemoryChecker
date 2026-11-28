@@ -142,8 +142,13 @@ block in 0..1 MiB or in T), first: [..32], flush}`.
 The helper then closes the device and remounts (macOS `mountDisk`, keeping its exit status and a redacted text;
 Windows drops `VolumeLocks`). Then it polls `disks::find(id, size)` every 1 s for up to 10 s, until
 `Fingerprint::of(found) == expected`. `expected` is `job.layout`, else the layout found at the start. The result is
-`LayoutAfter: Same | Changed | TableGone | DriveGone | Unreadable`, where TableGone means no partitions where there
-were some, and Unreadable means `table_unreadable` or a scan error / timeout.
+`LayoutAfter: Same | Changed | TableGone | DriveGone | Unreadable | NotCompared`, where TableGone means no
+partitions where there were some, and Unreadable means `table_unreadable` or a scan error / timeout. When the table
+could not be read at the **start** (`table_unreadable` of the drive the helper found), there is nothing to compare
+with: any listing of the drive afterwards is `NotCompared` (it ends the polling), which neither passes nor fails, so
+the read-back check alone decides about trust. A drive that is gone stays `DriveGone`, and a scan that does not
+answer stays `Unreadable` (the drive was not seen). The report keeps `notCompared`. *Alternative:* call it
+`Unreadable` / `Changed`. Rejected: such a drive could never get a trusted verdict.
 
 *Honesty.* A matching re-read proves only that the drive **answers** with the old data now. It may come from the
 controller's RAM. Only a replug followed by a new read proves what is on the flash. The spec and the texts make no
@@ -151,16 +156,24 @@ stronger claim. The note shown is "restored data read back unchanged", never "ve
 
 ### D6. Trust and notices (`main.rs`)
 A probe result is **trusted** when the run ended with an outcome, `restore_failures == 0`, the `RestoreCheck` has no
-mismatched or unreadable block, and `LayoutAfter == Same`. Only a trusted result reaches `record()`; `CheckRecord`
-gains `io_errors`, `mismatches`, `unsaved` and `restore_checked: bool`, all serde-default.
+mismatched or unreadable block, and `LayoutAfter` is `Same` or `NotCompared`. Only a trusted result reaches
+`record()`; `CheckRecord` gains `io_errors`, `mismatches`, `unsaved` and `restore_checked: bool` (true only when
+`RestoreCheck.checked > 0`), all serde-default.
 
 Everything else changes no knowledge. It sets a notice: `State.notices: HashMap<diskN, Notice{declared, kind}>`,
-with `kind = FullDiskAccess | Replug{reason, counts}`. The reasons, in order of precedence: `unresponsive`,
+with `kind = FullDiskAccess | Replug{reason, counts}`. The notice is stored when the task ends, under the same lock that
+frees the task slot and bumps `task_gen` (`end_task`): a scan taken during the task can be applied at any moment of
+it, and a notice stored earlier could be dropped by one that missed the drive for a moment. The reasons, in order of precedence: `unresponsive`,
 `restoreFailed`, `tableGone`, `mismatch`, `unreadable`, `layoutChanged`, `driveGone`, `layoutUnknown`.
 
-An access abort before any write has an empty restore check and needs no replug. One with an unconfirmed check gets
-both the access message and the replug notice. `send_disks` adds `notices` and `reports: {diskN: true}` to the
-`disks` message. Clearing: `FullDiskAccess` goes when the next task of that drive starts. `Replug` goes in
+An access abort before any write has an empty restore check and needs no replug. The helper says whether a write was
+attempted (`ProbeRun.wrote`, in `details.wrote` of a failed run; `false` also for a failed open). It is not inferred
+from a count, which can be 0 after writes. With `wrote: false` the layout plays no part in the replug decision (it
+stays in the report); "stopped answering" still asks for a replug by itself. A missing flag counts as written, and a
+helper that gave no details after the baseline is handled as before (replug, `layoutUnknown`). One with an
+unconfirmed check gets both the access message and the replug notice. `send_disks` adds `notices` and `reports: {diskN: true}` to the
+`disks` message. Clearing: `FullDiskAccess` goes when the next check (quick or full) of that drive starts; a speed test or a repair
+leaves it. `Replug` goes in
 `apply_scan` when a **successful** scan no longer lists `(id, declared)`. Notices live in memory, so a restart clears
 them too (documented limit: a replug faster than one scan interval, 2 s / 4 s, under the same `diskN` is missed).
 
@@ -223,9 +236,13 @@ New IPC actions take no free data:
 ### D10. Reports (`report.rs`, new)
 - **Who writes.** The helper appends JSON lines to `<job>/log.jsonl`, one per stage or failure, flushed per line.
   It opens the file once with `create_new` and, on Unix, `O_NOFOLLOW` (on Windows `FILE_FLAG_OPEN_REPARSE_POINT`).
-  Before anything else the helper checks with `symlink_metadata` that the job folder is a real directory; it refuses
-  the job otherwise, or when `log.jsonl` already exists.
-  `write_json` writes its tmp file the same way: it removes any old tmp file (that removes a link, not its target),
+  Before anything else the helper opens the job folder once (`JobFolder`; Unix `O_DIRECTORY | O_NOFOLLOW`) and then
+  reaches every file through that descriptor (`openat`, `unlinkat`, `renameat`), so swapping the folder for a link
+  later changes nothing. It refuses the job when the folder is not a real directory, or when `log.jsonl` already
+  exists. Windows has no `openat`: the helper holds the folder open without delete sharing (no rename or removal),
+  keeps `log.jsonl` open without delete sharing (the folder is never empty, so it cannot become a junction), checks
+  with `GetFinalPathNameByHandleW` that the log is inside the held folder, and writes nothing when that fails.
+  `write_json` writes its tmp file safely too: it removes any old tmp file (that removes a link, not its target),
   creates it new and renames it. The window reads `log.jsonl` and `result.json` after the helper exits (also when it
   "stopped without a result") and builds the report **as the user**. The job folder is created with
   `DirBuilder::new().mode(0o700)` and `create` (not `create_all`), so an existing folder or link is refused.
@@ -241,7 +258,10 @@ New IPC actions take no free data:
   `Disk` the user already sees.
 - **Redaction.** `redact(text, &disk, home)` replaces each mount path, each volume label (whole words, case
   sensitive) and the home folder with `<volume>` / `<home>`. It runs on every free text (OS error strings, `diskutil`
-  / `diskpart` output, truncated to 300 characters). The function is pure and unit-tested.
+  / `diskpart` output, truncated to 300 characters). A Windows drive letter (`E:`) is replaced only where no word
+  runs into it (not the end of `FILE:`). Placeholders are put in as private-use marks and spelled out at the end, so
+  a volume named `volume` (or `home`, `uuid`, `user`) cannot match inside one. The function is pure and
+  unit-tested.
 - **Retention.** After each write, files matching `^\d{8}-\d{6}-(probe|full|fix)-[A-Za-z0-9]+(-\d+)?\.json$` are
   pruned: those older than 90 days (by mtime) go first, then the oldest until 50 remain.
 - **Size.** Detailed lists stop at 32 items plus a count of the rest. A final check that the JSON is < 256 KiB drops
@@ -259,7 +279,8 @@ recorded verdict could mislead). The check, speed and repair buttons of that dri
 
 The verdict's faint line adds `countMismatch`, `countIo`, `countUnsaved` (when > 0) and `restoreVerified` (when
 `restoreChecked`). `restoreFailures` stays. "Show report" appears as a small link button in the faint line, or under
-the notice, when `reports[disk]`. Every new string goes into all 5 languages. Window texts follow the style of
+the notice, when `reports[disk]`. `State.reports` holds check reports only (quick and full): a repair report is
+written but never takes the link's place. Every new string goes into all 5 languages. Window texts follow the style of
 `i18n.js`. No size is computed in the window.
 
 ## Risks / Trade-offs
