@@ -71,11 +71,21 @@ const cases = {
   'disabled states': ['repRun', `out.push('btn=' + q('#repBtn').disabled, 'whole=' + q('#repWhole').disabled); click(q('#repBtn'));`],
   'other drive task': ['speedOther', `out.push('start=' + q('#speedBtn').disabled); click(q('#speedBtn'));`],
 };
+// steps for things the old page does not have: the messages must be exactly these
+const added = {
+  'Full Disk Access button': ['capFda', `click(q('#fdaBtn'));`, [{ action: 'open_privacy' }]],
+  'Show report under the notice': ['capFda', `click(q('#capNotice .linkbtn'));`, [{ action: 'reveal_report', disk: 'disk6' }]],
+  'Show report in the verdict': ['capFakeCounts', `click(q('#verdict .linkbtn'));`, [{ action: 'reveal_report', disk: 'disk6' }]],
+  'Show report with no verdict': ['capReportOnly', `click(q('#capIdle .linkbtn'));`, [{ action: 'reveal_report', disk: 'disk6' }]],
+  'no Full Disk Access button on Windows': ['capFdaWindows', `P('none', () => !q('#fdaBtn')); P('replug', () => !!q('#capNotice .verdict.bad'));`, []],
+  'replug: nothing to start': ['speedReplugBlocked', `P('speed', () => q('#speedBtn').disabled && !!q('#speedBtn').title); P('cap', () => q('#capBtn').disabled && !!q('#capBtn').title); click(q('#speedBtn')); click(q('#capBtn'));`, []],
+  'replug: no repair and no verdict': ['repReplugBlocked', `P('btn', () => q('#repBtn').disabled && !!q('#repBtn').title); P('lead', () => q('#repLead').textContent === t('errReplugFirst')); P('noWhole', () => q('#repWholeBox').style.display === 'none'); P('noVerdict', () => !q('#verdict').classList.contains('on')); click(q('#repBtn'));`, []],
+};
 const names = Object.keys(cases);
 const job = ([sc, steps]) => `(function(){ ${H} try { __umcScenario(${JSON.stringify(sc)}, 'en'); __sent.length = 0; ${steps} } catch (e) { out.push('ERR ' + e.message); } return JSON.stringify({ sent: __sent.map(m => JSON.stringify(m)), out }); })()`;
-const run = (html, tag) => {
+const run = (html, tag, list = names.map(n => cases[n])) => {
   writeFileSync(join(tmp, tag + '.html'), compose(html));
-  const jobs = names.map((n, i) => ({ js: job(cases[n]), theme: 'dark', width: 1180, height: 760, fresh: true }));
+  const jobs = list.map(c => ({ js: job(c), theme: 'dark', width: 1180, height: 760, fresh: true }));
   writeFileSync(join(tmp, tag + '.json'), JSON.stringify({ html: join(tmp, tag + '.html'), scale: 1, jobs }));
   const bin = join(tmp, 'render');
   const c = spawnSync('swiftc', ['-O', join(here, 'render.swift'), '-o', bin], { encoding: 'utf8' });
@@ -98,4 +108,16 @@ names.forEach((n, i) => {
   else console.log('same ' + String(cnt).padStart(2) + ' msg  ' + n + (sa.out.length ? '  ' + sa.out.join(' ') : '') + (sb.ok && sb.ok.length ? '  [' + sb.ok.length + ' ok probes]' : ''));
 });
 console.log(bad ? `${bad} of ${names.length} differ` : `identical: ${names.length} scripts, ${total} messages`);
-process.exit(bad ? 1 : 0);
+
+const addedNames = Object.keys(added);
+const c = run(newHtml, 'added', addedNames.map(n => added[n]));
+let failed = 0;
+addedNames.forEach((n, i) => {
+  const r = c[i] || {};
+  const want = added[n][2].map(m => JSON.stringify(m));
+  const ok = !!r.sent && JSON.stringify(r.sent) === JSON.stringify(want) && r.out.every(x => String(x).startsWith('ok:') && String(x).endsWith('=true'));
+  if (!ok) failed++;
+  console.log((ok ? 'ok   ' : 'FAIL ') + n + (ok ? '' : '  ' + JSON.stringify(r)));
+});
+console.log(failed ? `${failed} of ${addedNames.length} new steps failed` : `new steps pass: ${addedNames.length}`);
+process.exit(bad || failed ? 1 : 0);

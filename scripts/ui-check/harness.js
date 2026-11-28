@@ -106,6 +106,29 @@
   def('repBroken', () => only(view({ state: 'broken', value: 0, lossReal: 0, check: quick({ verdict: 'broken', real: 0 }), repair: plan('none', null, decl) }), 'repair'));
   def('repUnconfirmed', () => only(view({ state: 'unconfirmed', repair: plan('none', null, decl) }), 'repair'));
 
+  // notices of the last quick check and the report link
+  const notice = (reason, counts = {}, extra = {}) => ({ disk6: { kind: 'replug', reason, counts: { io: 0, mismatches: 0, unsaved: 0, restoreFailures: 0, n: 0, ...counts }, fda: false, ...extra } });
+  const fdaNotice = { disk6: { kind: 'fullDiskAccess', reason: '', counts: {}, fda: true } };
+  const withReport = { disk6: true };
+  const incident = () => notice('unresponsive', { io: 1882, unsaved: 1882 });
+  def('capFda', () => only(fakeView(), 'capacity', { notices: fdaNotice, reports: withReport }));
+  def('capFdaUnknown', () => only(view(), 'capacity', { notices: fdaNotice, reports: withReport }));
+  def('capFdaReplug', () => only(fakeView(), 'capacity', { notices: notice('unreadable', { n: 4096 }, { fda: true }), reports: withReport }));
+  // Windows: no Full Disk Access card or button, whatever a message says
+  def('capFdaWindows', () => only(fakeView(), 'capacity', { platform: 'windows', notices: notice('layoutUnknown', {}, { fda: true }), reports: withReport }));
+  def('capReplugUnresponsive', () => only(fakeView(), 'capacity', { notices: incident(), reports: withReport }));
+  def('capReplugTableGone', () => ({ disks: partDisks(), sel: 'disk6', tab: 'capacity', cap: { disk6: partView('repaired', { check: quick() }) }, notices: notice('tableGone'), reports: withReport }));
+  def('capReplugMismatch', () => only(view(), 'capacity', { notices: notice('mismatch', { n: 1, mismatches: 50, io: 1700, unsaved: 1650 }), reports: withReport }));
+  def('capReplugRestoreFailed', () => only(view(), 'capacity', { notices: notice('restoreFailed', { n: 12, restoreFailures: 12 }) }));
+  def('capFakeCounts', () => only(fakeView({ check: quick({ ioErrors: 1700, mismatches: 50, unsaved: 1650, restoreChecked: true }), remembered: true }), 'capacity', { reports: withReport }));
+  def('capBrokenCounts', () => only(view({ state: 'broken', value: 0, lossReal: 0, check: quick({ verdict: 'broken', real: 0, mismatches: 1882, restoreChecked: true }), repair: plan('none', null, decl) }), 'capacity', { reports: withReport }));
+  def('capReportOnly', () => only(view(), 'capacity', { reports: withReport }));
+  def('repReplugBlocked', () => ({ ...only(fakeView(), 'repair'), notices: incident(), confirm: true }));
+  def('speedReplugBlocked', () => only(fakeView(), 'speed', { notices: incident() }));
+  def('toastFda', () => ({ ...only(view(), 'capacity', { notices: fdaNotice, reports: withReport }), toast: 'errFullDiskAccess' }));
+  def('toastUnresponsive', () => ({ ...only(fakeView(), 'capacity', { notices: incident(), reports: withReport }), toast: 'errUnresponsive', toastArgs: { io: 1882, mismatches: 0 } }));
+  def('toastReplugFirst', () => ({ ...only(fakeView(), 'speed', { notices: incident() }), toast: 'errReplugFirst' }));
+
   // overlays on top of a base state
   def('update', () => ({ ...only(view(), 'speed'), update: true }));
   def('toast', () => ({ ...only(fakeView(), 'capacity'), toast: 'errFullInconclusive' }));
@@ -133,6 +156,7 @@
     series = { write: [], read: [] }; seriesDisk = null; seriesKind = null;
     for (const k of Object.keys(results)) delete results[k];
     capacity = {}; disks = []; disksLoaded = false; selected = null;
+    document.body.classList.remove('platform-macos', 'platform-windows');
     if (rescanPending) clearRescan();
     document.getElementById('repWhole').checked = false;
     document.getElementById('repConfirm').checked = false;
@@ -143,13 +167,13 @@
     const f = S[name];
     if (!f) throw new Error('unknown scenario ' + name);
     const c = f();
-    const o = { platform: 'macos', ...(opts || {}) };
+    const o = { platform: c.platform || 'macos', ...(opts || {}) };
     reset();
     R({ type: 'init', lang, language: lang, languages: ['en', 'ru', 'es', 'de', 'zh'], systemLang: 'en', version: '0.1.2', canUpdate: true,
       platform: o.platform, fat32Max: 32e9, speedSizes: [100, 1000, 5000], speedMb: 1000, capacityMode: c.mode || 'quick', autoUpdate: true });
     const wr = c.writable === undefined ? c.modal !== 'update' : c.writable;
     R({ type: 'update', checking: false, downloading: false, available: c.update || c.modal === 'update' ? { version: '0.2.0', notes: Array.from({ length: 12 }, (_, i) => `- change number ${i + 1} of the new version`).join('\n') } : null, writable: wr, status: null, ...(c.upd || {}) });
-    if (!c.noScan) R({ type: 'disks', disks: c.disks, capacity: c.cap, scanned: true, rescanned: 0 });
+    if (!c.noScan) R({ type: 'disks', disks: c.disks, capacity: c.cap, notices: c.notices || {}, reports: c.reports || {}, scanned: true, rescanned: 0 });
     if (c.sel) selectDrive(c.sel);
     if (c.series) { series = { write: c.series.write, read: c.series.read }; seriesDisk = c.series.disk; seriesKind = c.series.kind; }
     for (const [mb, w, r] of c.results || []) { const x = speedRes(mb, w, r); if (c.bad) x.speed.badBlocks = c.bad; res('disk6').speed.push(x); }

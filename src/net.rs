@@ -109,7 +109,8 @@ pub fn is_https(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-fn home_dir() -> PathBuf {
+/// The user's home folder (`HOME` / `USERPROFILE`).
+pub fn home_dir() -> PathBuf {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_default()
 }
 
@@ -135,6 +136,66 @@ pub fn cache_dir() -> PathBuf {
     base_dir("LOCALAPPDATA", "Library/Caches", ".cache")
 }
 
+/// The logs folder under the home folder `home`: `~/Library/Logs/UsbMemoryChecker` on macOS,
+/// `%LOCALAPPDATA%\UsbMemoryChecker\logs` on Windows (`local_app_data`, else the usual place under `home`), the cache
+/// folder on other systems.
+pub fn logs_dir_in(home: &Path, local_app_data: Option<PathBuf>) -> PathBuf {
+    if cfg!(windows) {
+        local_app_data.unwrap_or_else(|| home.join("AppData").join("Local")).join("UsbMemoryChecker").join("logs")
+    } else if cfg!(target_os = "macos") {
+        home.join("Library/Logs/UsbMemoryChecker")
+    } else {
+        home.join(".cache/UsbMemoryChecker")
+    }
+}
+
+/// Where the check reports go (the `checks` folder inside it).
+pub fn logs_dir() -> PathBuf {
+    logs_dir_in(&home_dir(), std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+}
+
+/// Shows the file in Finder or Explorer.
+pub fn reveal(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer reads its own command line: the quotes go around the path only
+        command("explorer.exe").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let status = command("/usr/bin/open").arg("-R").arg(path).status()?;
+        if status.success() { Ok(()) } else { Err(io::Error::other(format!("open -R ended with {status}"))) }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = path;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Opens System Settings at Privacy & Security, Full Disk Access (macOS only); when that pane cannot be opened,
+/// System Settings itself. The address is fixed: nothing from the window goes into it.
+pub fn open_privacy_settings() -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let open = |args: &[&str]| {
+            let out = output_timeout(command("/usr/bin/open").args(args), Duration::from_secs(10))?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+            }
+        };
+        open(&["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])
+            .or_else(|_| open(&["-b", "com.apple.systempreferences"]))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +209,21 @@ mod tests {
         assert!(!is_https("javascript:alert(1)"));
         assert!(!is_https("https://a b"));
         assert!(!is_https("https://"));
+    }
+
+    #[test]
+    fn logs_dir_follows_home() {
+        // the home is a parameter, so the test leaves the environment of the other tests alone
+        let home = Path::new("/tmp/someone");
+        let dir = logs_dir_in(home, None);
+        if cfg!(target_os = "macos") {
+            assert_eq!(dir, home.join("Library/Logs/UsbMemoryChecker"));
+        }
+        assert!(dir.starts_with(home));
+        if cfg!(windows) {
+            let local = PathBuf::from(r"D:\Local");
+            assert_eq!(logs_dir_in(home, Some(local.clone())), local.join("UsbMemoryChecker").join("logs"));
+        }
     }
 
     #[cfg(unix)]

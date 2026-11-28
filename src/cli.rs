@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::json;
 
-use crate::{bench, disks, fullcheck, helper, i18n};
+use crate::{bench, disks, fullcheck, helper, i18n, net, report, settings};
 
 fn disk(id: Option<&String>) -> Result<disks::Disk, String> {
     let id = id.ok_or("no drive id")?;
@@ -26,20 +26,86 @@ fn mount(d: &disks::Disk) -> Result<PathBuf, String> {
     d.main_volume().map(|v| PathBuf::from(&v.mount)).ok_or_else(|| "the drive has no mounted volume".into())
 }
 
-pub fn main(args: &[String]) -> i32 {
-    match run(args) {
-        Ok(v) => {
-            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
-            0
+/// What a command ended with: the JSON or the error text, and the report it left.
+struct Done {
+    result: Result<serde_json::Value, String>,
+    /// A quick check whose result cannot be trusted: the JSON is printed all the same, and the command fails.
+    untrusted: Option<String>,
+    report: Option<PathBuf>,
+}
+
+impl Done {
+    fn error(&self) -> Option<&str> {
+        match &self.result {
+            Err(e) => Some(e),
+            Ok(_) => self.untrusted.as_deref(),
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            1
-        }
+    }
+
+    fn exit_code(&self) -> i32 {
+        i32::from(self.error().is_some())
     }
 }
 
-fn run(args: &[String]) -> Result<serde_json::Value, String> {
+/// Why the numbers of a quick check that ran to its end must not be relied on.
+fn untrusted(judged: &crate::Judged) -> Option<String> {
+    let (key, _) = judged.result.as_ref().err()?;
+    Some(match &judged.replug {
+        Some(replug) => format!("the result cannot be trusted ({})", replug.reason),
+        None => format!("the result cannot be trusted ({key})"),
+    })
+}
+
+impl From<Result<serde_json::Value, String>> for Done {
+    fn from(result: Result<serde_json::Value, String>) -> Done {
+        Done { result, untrusted: None, report: None }
+    }
+}
+
+pub fn main(args: &[String]) -> i32 {
+    let done = run(args);
+    let code = done.exit_code();
+    if let Ok(v) = &done.result {
+        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+    }
+    if let Some(e) = done.error() {
+        eprintln!("error: {e}");
+    }
+    // always the last line on stderr
+    if let Some(path) = done.report {
+        eprintln!("report: {}", path.display());
+    }
+    code
+}
+
+/// The text of a failed helper run: its cause, when it gave one, and its message.
+fn failure_text(cause: Option<&str>, message: &str) -> String {
+    match cause {
+        Some(cause) => format!("{cause}: {message}"),
+        None => message.to_string(),
+    }
+}
+
+/// Writes the report as the window does; a failure is only printed.
+fn write_report(mut rep: report::Report) -> Option<PathBuf> {
+    report::write(&report::dir(), &mut rep).map_err(|e| eprintln!("could not write the report: {e}")).ok()
+}
+
+fn run(args: &[String]) -> Done {
+    match args.first().map(String::as_str) {
+        Some("full") => match disk(args.get(1)) {
+            Ok(d) => full(&d, args),
+            Err(e) => Err(e).into(),
+        },
+        Some(action @ ("probe" | "fix")) => match disk(args.get(1)).and_then(|d| Ok((job(action, &d, args)?, d))) {
+            Ok((job, d)) => elevated(&d, &job),
+            Err(e) => Err(e).into(),
+        },
+        _ => other(args).into(),
+    }
+}
+
+fn other(args: &[String]) -> Result<serde_json::Value, String> {
     let cancel = AtomicBool::new(false);
     match args.first().map(String::as_str) {
         Some("list") => Ok(json!(disks::list()?)),
@@ -52,12 +118,24 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             .map_err(|e| format!("{e:?}"))?;
             Ok(json!(r))
         }
-        Some("full") => {
-            let d = disk(args.get(1))?;
-            let limit = args.get(2).and_then(|s| s.parse::<u64>().ok()).map(|mb| mb << 20);
+        _ => Err(
+            "usage: --cli list | speed <disk> <MB> | full <disk> [MB] | probe <disk> | fix <disk> <real> [fs] [label]"
+                .into(),
+        ),
+    }
+}
+
+fn full(d: &disks::Disk, args: &[String]) -> Done {
+    let started = settings::now();
+    let home = net::home_dir();
+    let cancel = AtomicBool::new(false);
+    let limit = args.get(2).and_then(|s| s.parse::<u64>().ok()).map(|mb| mb << 20);
+    let (measured, result) = match mount(d) {
+        Err(e) => (None, Err(("errNoVolume", e))),
+        Ok(mount) => {
             let mut last = 0u64;
             let mut told_early = false;
-            let r = fullcheck::run(&mount(&d)?, limit, &cancel, &mut |p| {
+            let r = fullcheck::run(&mount, limit, &cancel, &mut |p| {
                 if p.early && !told_early {
                     told_early = true;
                     eprintln!("data loss found after {} MB: writing stopped, checking what was written", p.total >> 20);
@@ -66,42 +144,97 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
                     last = p.done;
                     eprintln!("{} {} / {} MB", p.op, p.done >> 20, p.total >> 20);
                 }
-            })
-            .map_err(|e| match e {
-                fullcheck::Error::Gone => {
-                    "the drive is gone: a test file is missing (unplugged or remounted)".to_string()
-                }
-                e => format!("{e:?}"),
-            })?;
-            if r.stopped_early && !told_early {
+            });
+            if let Ok(r) = &r
+                && r.stopped_early
+                && !told_early
+            {
                 eprintln!(
                     "writing stopped early after {} MB: samples could not be read, checked what was written",
                     r.tested >> 20
                 );
             }
-            Ok(json!(r))
+            let result = match &r {
+                Ok(o) => Ok(json!(o)),
+                Err(fullcheck::Error::Gone) => Err((
+                    "errDriveGone",
+                    "the drive is gone: a test file is missing (unplugged or remounted)".to_string(),
+                )),
+                Err(e) => Err((full_key(e), format!("{e:?}"))),
+            };
+            (Some(r), result)
         }
-        Some(action @ ("probe" | "fix")) => {
-            let d = disk(args.get(1))?;
-            let job = job(action, &d, args)?;
-            let mut last = String::new();
-            helper::run(&job, i18n::admin_prompt("en"), &cancel, &mut |f, stage| {
-                let line = format!("{stage} {:.0}%", f * 100.0);
-                if line != last {
-                    eprintln!("{line}");
-                    last = line;
-                }
-            })
-            .map_err(|e| match e {
-                helper::RunError::Declined => "administrator access was not given".to_string(),
-                helper::RunError::Failed(e) => e,
-            })
-        }
-        _ => Err(
-            "usage: --cli list | speed <disk> <MB> | full <disk> [MB] | probe <disk> | fix <disk> <real> [fs] [label]"
-                .into(),
-        ),
+    };
+    let outcome = match &result {
+        Ok(_) => report::OutcomePart { key: "ok".into(), ..Default::default() },
+        Err((key, text)) => report::OutcomePart { key: (*key).into(), error: Some(text.clone()), ..Default::default() },
+    };
+    let rep = report::Report::new(report::Kind::Full, d, started, settings::now())
+        .full_data(measured.as_ref(), d, &home)
+        .ended(outcome, d, &home);
+    Done { result: result.map_err(|(_, text)| text), untrusted: None, report: write_report(rep) }
+}
+
+fn full_key(e: &fullcheck::Error) -> &'static str {
+    match e {
+        fullcheck::Error::Cancelled => "errCancelled",
+        fullcheck::Error::NoSpace(_) => "errNoSpaceFull",
+        fullcheck::Error::Io(_) => "errIo",
+        fullcheck::Error::Inconclusive => "errFullInconclusive",
+        fullcheck::Error::Gone => "errDriveGone",
     }
+}
+
+/// `probe` and `fix`: the run of the elevated helper and its report.
+fn elevated(d: &disks::Disk, job: &helper::Job) -> Done {
+    let started = settings::now();
+    let home = net::home_dir();
+    let cancel = AtomicBool::new(false);
+    let mut last = String::new();
+    let ran = helper::run(job, i18n::admin_prompt("en"), &cancel, &mut |f, stage| {
+        let line = format!("{stage} {:.0}%", f * 100.0);
+        if line != last {
+            eprintln!("{line}");
+            last = line;
+        }
+    });
+    let mut not_trusted = None;
+    let rep = if job.action == helper::Action::Probe {
+        let judged = crate::judge_probe(&ran.result, &ran.log);
+        not_trusted = untrusted(&judged);
+        if let Some(replug) = &judged.replug {
+            eprintln!(
+                "warning: the result cannot be trusted ({}): unplug the drive, plug it in again and check it again; \
+                 do not format, initialize or repair it first",
+                replug.reason
+            );
+        }
+        report::Report::new(report::Kind::Probe, d, started, settings::now())
+            .probe_data(&ran.log, &ran.result, d, &home)
+            .ended(judged.outcome_part(&ran.result), d, &home)
+    } else {
+        let named = report::with_new_label(d, &helper::clean_label(&job.label));
+        let planned = helper::fix_size(job).unwrap_or(job.real);
+        let fs = if job.fs == helper::Fs::Fat32 { "fat32" } else { "exfat" };
+        let outcome = match &ran.result {
+            Ok(_) => report::OutcomePart { key: "ok".into(), ..Default::default() },
+            Err(helper::RunError::Declined) => report::OutcomePart { key: "errDeclined".into(), ..Default::default() },
+            Err(helper::RunError::Failed { message, cause, .. }) => report::OutcomePart {
+                key: "errHelper".into(),
+                cause: cause.clone(),
+                error: Some(message.clone()),
+                ..Default::default()
+            },
+        };
+        report::Report::new(report::Kind::Fix, d, started, settings::now())
+            .fix_data(planned, fs, &ran.log, &named, &home)
+            .ended(outcome, &named, &home)
+    };
+    let result = ran.result.map_err(|e| match e {
+        helper::RunError::Declined => "administrator access was not given".to_string(),
+        helper::RunError::Failed { message, cause, .. } => failure_text(cause.as_deref(), &message),
+    });
+    Done { result, untrusted: not_trusted, report: write_report(rep) }
 }
 
 /// The job of `--cli probe|fix <disk> <real bytes|0> [exfat|fat32] [LABEL]`: no exact partition size and no layout
@@ -136,6 +269,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_error_names_the_cause() {
+        assert_eq!(failure_text(Some("privacy"), "Operation not permitted"), "privacy: Operation not permitted");
+        assert_eq!(failure_text(None, "the helper stopped without a result"), "the helper stopped without a result");
+    }
+
+    #[test]
+    fn cli_probe_with_an_untrusted_result_fails() {
+        let done = |layout: &str| {
+            let v = json!({"verdict": "genuine", "reported": 10, "real": 10, "points": 1, "badPoints": 0,
+                "seconds": 1.0, "restoreFailures": 0, "restoreCheck": {"checked": 1}, "layoutAfter": layout});
+            let result: Result<serde_json::Value, helper::RunError> = Ok(v.clone());
+            let judged = crate::judge_probe(&result, &[]);
+            Done { result: Ok(v), untrusted: untrusted(&judged), report: None }
+        };
+        let bad = done("changed");
+        assert_eq!(bad.exit_code(), 1);
+        assert_eq!(bad.error(), Some("the result cannot be trusted (layoutChanged)"));
+        assert!(bad.result.is_ok(), "the numbers are still printed");
+        let good = done("same");
+        assert_eq!((good.exit_code(), good.error()), (0, None));
+        assert_eq!(Done::from(Err("boom".to_string())).exit_code(), 1);
+    }
+
+    #[test]
     fn cli_fix_builds_a_job_without_a_plan_or_layout() {
         let d = disks::Disk {
             id: "disk4".into(),
@@ -149,6 +306,7 @@ mod tests {
             partitions: Vec::new(),
             table_unreadable: false,
             table_id: String::new(),
+            partition_fs: Vec::new(),
         };
         let args: Vec<String> = ["fix", "disk4", "0", "fat32", "MY"].map(String::from).to_vec();
         let j = job("fix", &d, &args).unwrap();

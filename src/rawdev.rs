@@ -50,6 +50,52 @@ impl Device for RawDevice {
         }
         Ok(())
     }
+
+    /// Asks the drive to commit its write cache.
+    fn flush(&mut self) -> io::Result<()> {
+        flush_cache(&self.file)
+    }
+}
+
+/// `dk_synchronize_t` of <sys/disk.h>.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DkSynchronize {
+    offset: u64,
+    length: u64,
+    options: u32,
+    reserved: [u8; 4],
+}
+
+/// `_IOW('d', 22, dk_synchronize_t)` of <sys/disk.h>.
+#[cfg(target_os = "macos")]
+const DKIOCSYNCHRONIZE: libc::c_ulong = 0x8018_6416;
+
+#[cfg(target_os = "macos")]
+fn flush_cache(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // all zeros: the whole cache of the device
+    let request = DkSynchronize { offset: 0, length: 0, options: 0, reserved: [0; 4] };
+    // SAFETY: the ioctl reads one DkSynchronize from a valid pointer.
+    if unsafe { libc::ioctl(file.as_raw_fd(), DKIOCSYNCHRONIZE, &request) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn flush_cache(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: an open handle.
+    if unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(file.as_raw_handle() as _) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn flush_cache(file: &File) -> io::Result<()> {
+    file.sync_all()
 }
 
 /// Size the device reports, asked from the device itself.
@@ -157,5 +203,17 @@ impl VolumeLocks {
             held.push(f);
         }
         Ok(VolumeLocks(held))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dk_synchronize_layout() {
+        use super::*;
+        assert_eq!(std::mem::size_of::<DkSynchronize>(), 24);
+        // _IOW('d', 22, 24 bytes)
+        assert_eq!(DKIOCSYNCHRONIZE, 0x8000_0000 | (24 << 16) | (libc::c_ulong::from(b'd') << 8) | 22);
     }
 }
