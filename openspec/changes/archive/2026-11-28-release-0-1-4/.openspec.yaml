@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-28
+# A release: version bump and release notes only, no change to what the app does.
+skip_specs: true
