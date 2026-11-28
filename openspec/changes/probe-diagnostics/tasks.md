@@ -260,11 +260,14 @@ a running `UsbMemoryChecker.app` instance. Leave no background processes (`pgrep
 - [x] 12.2 Same RAM disk in the window (`HOME=<scratchpad>/home UMC_SHOW_VIRTUAL=1 UMC_NO_ELEVATE=1`, with
   `UMC_DEV_SCRIPT` for a screenshot): the verdict shows `restoreVerified` and "Show report", and pressing it reveals the
   file in Finder. Quit the app instance you started (only that one).
-- [ ] 12.3 For Roman (needs the password and a change in System Settings; RAM disk only): remove UsbMemoryChecker from
+- [x] 12.3 For Roman (needs the password and a change in System Settings; RAM disk only): remove UsbMemoryChecker from
   Full Disk Access, start the built app with `HOME=<scratch> UMC_SHOW_VIRTUAL=1` (elevated, without
   `UMC_NO_ELEVATE`), and run a quick check of a RAM disk. Expect the Full Disk Access notice (not a generic error), a
   report with `cause: privacy`, the `op` and `errno: 1`. This confirms the `EPERM` assumption of design D7. If the
   errno differs, record it and adjust task 1.1.
+  Result (2026-11-28): run on a real USB stick, not on a RAM disk. Two runs: Full Disk Access notice shown; report
+  `cause: privacy`, `op: open`, `errno: 1`, layout `same`; the open was refused, so nothing was written. The kernel log
+  shows the matching `deny(1) file-read-data`. A RAM disk was not tried.
 - [ ] 12.4 For Roman: press "Open Full Disk Access settings" on macOS 27 and confirm that System Settings opens at
   Privacy & Security → Full Disk Access (or at least System Settings, through the fallback).
 
